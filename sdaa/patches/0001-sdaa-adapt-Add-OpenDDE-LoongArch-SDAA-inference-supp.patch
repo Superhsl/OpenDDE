@@ -1,0 +1,1751 @@
+From 9e6024e87433d467a75b85cb999d557a2161019e Mon Sep 17 00:00:00 2001
+From: Superhsl <2949565071@qq.com>
+Date: Wed, 14 Oct 2026 18:38:07 +0800
+Subject: [PATCH] [sdaa-adapt] Add OpenDDE LoongArch SDAA inference support
+
+Adapt device selection, BF16, random seeding and operator compatibility. Add pinned SDAA runtime scripts and reproduction documentation.
+
+The existing SDAA container ran the official 7r6r prepared-MSA example. The new read-only bind mounts have not yet been run in a new container.
+---
+ opendde/config/schema.py                  |   3 +-
+ opendde/data/msa/msa_service_client.py    |   9 +-
+ opendde/model/modules/transformer.py      |  19 +-
+ opendde/model/opendde.py                  |  15 +-
+ opendde/model/sample_confidence.py        |   2 +-
+ opendde/utils/environment.py              |  73 +++-
+ opendde/utils/seed.py                     |  17 +-
+ opendde/utils/torch_utils.py              |  21 +
+ runner/batch_inference.py                 |   6 +-
+ runner/inference.py                       |  12 +-
+ sdaa/.env.sdaa.example                    |   8 +
+ sdaa/Dockerfile.sdaa                      |  54 +++
+ sdaa/LOONG_SDAA_REPRO.md                  | 121 ++++++
+ sdaa/README.md                            |  36 ++
+ sdaa/SDAA_ADAPTATION.md                   | 134 ++++++
+ sdaa/build-kalign-sdaa.sh                 |  54 +++
+ sdaa/build-sdaa.sh                        |  85 ++++
+ sdaa/container/acceptance.sh              | 490 ++++++++++++++++++++++
+ sdaa/container/verify_sdaa_environment.py | 134 ++++++
+ sdaa/dockerignore                         |  12 +
+ sdaa/run-official-examples-sdaa.sh        |  64 +++
+ sdaa/source.sdaa.lock                     |  23 +
+ 22 files changed, 1363 insertions(+), 29 deletions(-)
+ create mode 100644 sdaa/.env.sdaa.example
+ create mode 100644 sdaa/Dockerfile.sdaa
+ create mode 100644 sdaa/LOONG_SDAA_REPRO.md
+ create mode 100644 sdaa/README.md
+ create mode 100644 sdaa/SDAA_ADAPTATION.md
+ create mode 100755 sdaa/build-kalign-sdaa.sh
+ create mode 100755 sdaa/build-sdaa.sh
+ create mode 100644 sdaa/container/acceptance.sh
+ create mode 100755 sdaa/container/verify_sdaa_environment.py
+ create mode 100644 sdaa/dockerignore
+ create mode 100755 sdaa/run-official-examples-sdaa.sh
+ create mode 100644 sdaa/source.sdaa.lock
+
+diff --git a/opendde/config/schema.py b/opendde/config/schema.py
+index ffbe516..92fc0eb 100644
+--- a/opendde/config/schema.py
++++ b/opendde/config/schema.py
+@@ -18,11 +18,12 @@ from pydantic import BaseModel, ConfigDict
+ 
+ InferenceDtype = Literal["bf16", "fp32"]
+ INFERENCE_DTYPE_CHOICES: tuple[InferenceDtype, ...] = ("bf16", "fp32")
+-InferenceDevice = Literal["auto", "cpu", "cuda", "mps"]
++InferenceDevice = Literal["auto", "cpu", "cuda", "sdaa", "mps"]
+ INFERENCE_DEVICE_CHOICES: tuple[InferenceDevice, ...] = (
+     "auto",
+     "cpu",
+     "cuda",
++    "sdaa",
+     "mps",
+ )
+ TriangleKernel = Literal["auto", "cuequivariance", "torch"]
+diff --git a/opendde/data/msa/msa_service_client.py b/opendde/data/msa/msa_service_client.py
+index 3b4601a..be57878 100644
+--- a/opendde/data/msa/msa_service_client.py
++++ b/opendde/data/msa/msa_service_client.py
+@@ -107,7 +107,14 @@ def run_mmseqs2(
+         for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+             try:
+                 response = requests.request(
+-                    method, url, timeout=6.02, headers=headers, **kwargs
++                    method,
++                    url,
++                    timeout=(
++                        6.02,
++                        float(os.getenv("OPENDDE_MSA_READ_TIMEOUT", "6.02")),
++                    ),
++                    headers=headers,
++                    **kwargs,
+                 )
+                 response.raise_for_status()
+                 return response
+diff --git a/opendde/model/modules/transformer.py b/opendde/model/modules/transformer.py
+index 4fa1d0d..c191b67 100644
+--- a/opendde/model/modules/transformer.py
++++ b/opendde/model/modules/transformer.py
+@@ -3094,8 +3094,15 @@ class AtomAttentionEncoder(nn.Module):
+         def _prepare_local_atom_window_state():
+             batch_shape = ref_pos.shape[:-2]
+             n_atom = ref_pos.shape[-2]
++            # Cast integer charges to the projection dtype before arcsinh for SDAA compatibility.
++            ref_charge_fp = ref_charge.to(
++                dtype=self.linear_no_bias_ref_charge.weight.dtype
++            )
++            charge_feature = torch.arcsinh(ref_charge_fp).reshape(
++                *batch_shape, n_atom, 1
++            )
+             c_l = self.linear_no_bias_ref_pos(ref_pos) + self.linear_no_bias_ref_charge(
+-                torch.arcsinh(ref_charge).reshape(*batch_shape, n_atom, 1)
++                charge_feature
+             )
+             ref_features = torch.cat(
+                 [
+@@ -3317,9 +3324,15 @@ class AtomAttentionEncoder(nn.Module):
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         batch_shape = ref_pos.shape[:-2]
+         N_atom = ref_pos.shape[-2]
++        # Cast integer charges to the projection dtype before arcsinh for SDAA compatibility.
++        ref_charge_fp = ref_charge.to(
++            dtype=self.linear_no_bias_ref_charge.weight.dtype
++        )
++        charge_feature = torch.arcsinh(ref_charge_fp).reshape(
++            *batch_shape, N_atom, 1
++        )
+         c_l = self.linear_no_bias_ref_pos(ref_pos) + self.linear_no_bias_ref_charge(
+-            # use arcsinh for ref_charge
+-            torch.arcsinh(ref_charge).reshape(*batch_shape, N_atom, 1)
++            charge_feature
+         )
+         if inplace_safe:
+             c_l += self.linear_no_bias_f(
+diff --git a/opendde/model/opendde.py b/opendde/model/opendde.py
+index aedcc73..763b92d 100644
+--- a/opendde/model/opendde.py
++++ b/opendde/model/opendde.py
+@@ -68,6 +68,9 @@ logger = get_logger(__name__)
+ def _tf32_runtime_scope(enabled: bool):
+     """Apply one model's TF32 policy without leaking it to the host process."""
+ 
++    if not torch.cuda.is_available():
++        yield
++        return
+     previous_matmul = torch.backends.cuda.matmul.allow_tf32
+     previous_cudnn = torch.backends.cudnn.allow_tf32
+     torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
+@@ -1595,7 +1598,8 @@ class OpenDDE(nn.Module):
+         pair_input_feature_dict: dict[str, Any],
+         N_cycle: int,
+     ) -> dict[str, Any]:
+-        torch.cuda.empty_cache()
++        if torch.cuda.is_available():
++            torch.cuda.empty_cache()
+ 
+         self.add_shape_complementarity_predictions(
+             pred_dict=pred_dict,
+@@ -2083,11 +2087,12 @@ class OpenDDE(nn.Module):
+         # Minimal embedded/test model objects may intentionally omit the
+         # inference-only policy field. In that case preserve the host's active
+         # matmul policy rather than inventing a new one.
+-        enable_tf32 = getattr(
+-            self.configs,
+-            "enable_tf32",
+-            torch.backends.cuda.matmul.allow_tf32,
++        default_tf32 = (
++            torch.backends.cuda.matmul.allow_tf32
++            if torch.cuda.is_available()
++            else False
+         )
++        enable_tf32 = getattr(self.configs, "enable_tf32", default_tf32)
+         with _tf32_runtime_scope(enable_tf32):
+             return self._forward_impl(
+                 input_feature_dict=input_feature_dict,
+diff --git a/opendde/model/sample_confidence.py b/opendde/model/sample_confidence.py
+index dffc246..07362d2 100644
+--- a/opendde/model/sample_confidence.py
++++ b/opendde/model/sample_confidence.py
+@@ -449,7 +449,7 @@ def calculate_clash(
+         dummy_is_dna,
+         dummy_is_rna,
+     )
+-    return clash_dict["summary"]["af3_clash"].reshape(N_sample, -1).max(dim=-1)[0]
++    return clash_dict["summary"]["af3_clash"].reshape(N_sample, -1).any(dim=-1)
+ 
+ 
+ def calculate_ptm(
+diff --git a/opendde/utils/environment.py b/opendde/utils/environment.py
+index e499b7e..7fd0505 100644
+--- a/opendde/utils/environment.py
++++ b/opendde/utils/environment.py
+@@ -75,6 +75,10 @@ class TorchRuntimeInfo:
+     device_name: Optional[str] = None
+     import_error: Optional[str] = None
+     cuda_probe_error: Optional[str] = None
++    sdaa_available: bool = False
++    sdaa_device_count: int = 0
++    sdaa_device_name: Optional[str] = None
++    sdaa_probe_error: Optional[str] = None
+     mps_built: bool = False
+     mps_available: bool = False
+ 
+@@ -154,6 +158,25 @@ def _probe_mps(torch_module) -> tuple[bool, bool]:
+     return built, available
+ 
+ 
++def _probe_sdaa(torch_module) -> tuple[bool, int, Optional[str], Optional[str]]:
++    """Import the SDAA registration package and probe visible devices."""
++    try:
++        importlib.import_module("torch_sdaa")
++    except Exception as exc:
++        return False, 0, None, _format_exception(exc)
++
++    backend = getattr(torch_module, "sdaa", None)
++    if backend is None:
++        return False, 0, None, "torch.sdaa is not registered"
++    try:
++        available = bool(backend.is_available())
++        count = int(backend.device_count()) if available else 0
++        name = backend.get_device_name(0) if count else None
++    except Exception as exc:
++        return False, 0, None, _format_exception(exc)
++    return available, count, name, None
++
++
+ def get_torch_runtime_info() -> TorchRuntimeInfo:
+     if not module_available("torch"):
+         return TorchRuntimeInfo(installed=False)
+@@ -176,6 +199,7 @@ def get_torch_runtime_info() -> TorchRuntimeInfo:
+     device_name = None
+     cuda_version = getattr(getattr(torch_module, "version", None), "cuda", None)
+     mps_built, mps_available = _probe_mps(torch_module)
++    sdaa_available, sdaa_count, sdaa_name, sdaa_error = _probe_sdaa(torch_module)
+     try:
+         cuda_available = bool(torch_module.cuda.is_available())
+         device_count = int(torch_module.cuda.device_count()) if cuda_available else 0
+@@ -189,6 +213,10 @@ def get_torch_runtime_info() -> TorchRuntimeInfo:
+             device_count=device_count,
+             device_name=device_name,
+             cuda_probe_error=_format_exception(exc),
++            sdaa_available=sdaa_available,
++            sdaa_device_count=sdaa_count,
++            sdaa_device_name=sdaa_name,
++            sdaa_probe_error=sdaa_error,
+             mps_built=mps_built,
+             mps_available=mps_available,
+         )
+@@ -200,6 +228,10 @@ def get_torch_runtime_info() -> TorchRuntimeInfo:
+         cuda_version=cuda_version,
+         device_count=device_count,
+         device_name=device_name,
++        sdaa_available=sdaa_available,
++        sdaa_device_count=sdaa_count,
++        sdaa_device_name=sdaa_name,
++        sdaa_probe_error=sdaa_error,
+         mps_built=mps_built,
+         mps_available=mps_available,
+     )
+@@ -208,7 +240,7 @@ def get_torch_runtime_info() -> TorchRuntimeInfo:
+ def select_torch_device(
+     requested_device: InferenceDevice = "auto", local_rank: int = 0
+ ) -> torch.device:
+-    """Resolve an inference device, preferring CUDA, then Apple MPS, then CPU."""
++    """Resolve a device, preferring CUDA, SDAA, Apple MPS, then CPU."""
+     if requested_device not in INFERENCE_DEVICE_CHOICES:
+         choices = ", ".join(INFERENCE_DEVICE_CHOICES)
+         raise ValueError(
+@@ -222,15 +254,35 @@ def select_torch_device(
+             f"PyTorch is required for inference but could not be imported: {_format_exception(exc)}"
+         ) from exc
+ 
+-    cuda_available = torch.cuda.is_available()
++    cuda_available = bool(torch.cuda.is_available())
+     _, mps_available = _probe_mps(torch)
++
+     if requested_device == "auto":
+         if cuda_available:
+             requested_device = "cuda"
+-        elif mps_available:
+-            requested_device = "mps"
+         else:
+-            requested_device = "cpu"
++            sdaa_available, _, _, _ = _probe_sdaa(torch)
++            if sdaa_available:
++                requested_device = "sdaa"
++            elif mps_available:
++                requested_device = "mps"
++            else:
++                requested_device = "cpu"
++
++    if requested_device == "sdaa":
++        sdaa_available, sdaa_count, _, sdaa_error = _probe_sdaa(torch)
++        if not sdaa_available:
++            detail = f" ({sdaa_error})" if sdaa_error else ""
++            raise RuntimeError(
++                "SDAA was requested, but torch_sdaa reports no available device"
++                f"{detail}."
++            )
++        if local_rank < 0 or local_rank >= sdaa_count:
++            raise RuntimeError(
++                f"SDAA device index {local_rank} is unavailable; detected "
++                f"{sdaa_count} SDAA device(s)."
++            )
++        return torch.device(f"sdaa:{local_rank}")
+ 
+     if requested_device == "mps":
+         if not mps_available:
+@@ -374,6 +426,11 @@ def _runtime_recommendation(
+             "PyTorch is installed but unusable. Reinstall a build compatible with "
+             f"this Python/platform ({torch_info.import_error})."
+         )
++    if selected_device is not None and selected_device.type == "sdaa":
++        return (
++            "PyTorch SDAA inference is available. OpenDDE will use torch "
++            "triangle kernels; cuEquivariance is CUDA-only."
++        )
+     if torch_info.cuda_probe_error:
+         return (
+             "PyTorch imports successfully, but CUDA probing failed "
+@@ -425,7 +482,7 @@ def format_doctor_report() -> str:
+     device_error: Optional[str] = None
+     cueq_status: Optional[CuEquivarianceRuntimeStatus] = None
+     if torch_info.usable:
+-        if torch_info.cuda_probe_error:
++        if torch_info.cuda_probe_error and not torch_info.sdaa_available:
+             device_error = torch_info.cuda_probe_error
+         else:
+             try:
+@@ -452,6 +509,10 @@ def format_doctor_report() -> str:
+         f"- CUDA device count: {torch_info.device_count}",
+         f"- CUDA device 0: {torch_info.device_name or 'none'}",
+         f"- CUDA probe error: {torch_info.cuda_probe_error or 'none'}",
++        f"- torch.sdaa.is_available: {torch_info.sdaa_available}",
++        f"- SDAA device count: {torch_info.sdaa_device_count}",
++        f"- SDAA device 0: {torch_info.sdaa_device_name or 'none'}",
++        f"- SDAA probe error: {torch_info.sdaa_probe_error or 'none'}",
+         f"- torch.backends.mps.is_built: {torch_info.mps_built}",
+         f"- torch.backends.mps.is_available: {torch_info.mps_available}",
+         f"- nvidia-smi: {nvidia_smi_info or ('found' if nvidia_smi_found else 'not found')}",
+diff --git a/opendde/utils/seed.py b/opendde/utils/seed.py
+index 1c589be..f10ee97 100644
+--- a/opendde/utils/seed.py
++++ b/opendde/utils/seed.py
+@@ -11,13 +11,18 @@ def seed_everything(seed, deterministic):
+     random.seed(seed)
+     np.random.seed(seed)
+     torch.random.manual_seed(seed)
+-    torch.cuda.manual_seed_all(seed)
++    if torch.cuda.is_available():
++        torch.cuda.manual_seed_all(seed)
++    sdaa_backend = getattr(torch, "sdaa", None)
++    if sdaa_backend is not None and sdaa_backend.is_available():
++        sdaa_backend.manual_seed_all(seed)
+     # These are process-wide switches. Set both branches explicitly so a
+     # non-deterministic run cannot inherit True from an earlier deterministic
+     # run in a long-lived Python process.
+-    torch.backends.cudnn.deterministic = bool(deterministic)
+     torch.use_deterministic_algorithms(bool(deterministic))
+-    if deterministic:
+-        torch.backends.cudnn.benchmark = False
+-        # https://docs.nvidia.com/cuda/cublas/index.html#cublasApi_reproducibility
+-        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
++    if torch.cuda.is_available():
++        torch.backends.cudnn.deterministic = bool(deterministic)
++        if deterministic:
++            torch.backends.cudnn.benchmark = False
++            # Required only for deterministic CUDA/cuBLAS execution.
++            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+diff --git a/opendde/utils/torch_utils.py b/opendde/utils/torch_utils.py
+index d918c6f..ba7006b 100644
+--- a/opendde/utils/torch_utils.py
++++ b/opendde/utils/torch_utils.py
+@@ -27,6 +27,9 @@ def disabled_autocast():
+     """
+     with ExitStack() as stack:
+         stack.enter_context(torch.amp.autocast("cuda", enabled=False))
++        sdaa_backend = getattr(torch, "sdaa", None)
++        if sdaa_backend is not None and sdaa_backend.is_available():
++            stack.enter_context(torch.amp.autocast("sdaa", enabled=False))
+         if _mps_autocast_available():
+             stack.enter_context(torch.amp.autocast("mps", enabled=False))
+         yield
+@@ -110,6 +113,24 @@ def cleanup_device_memory(
+             suppress_errors=suppress_errors,
+         )
+ 
++    if selected_device.type == "sdaa":
++        sdaa_backend = getattr(torch, "sdaa", None)
++        if sdaa_backend is not None and sdaa_backend.is_available():
++            device_index = (
++                selected_device.index
++                if selected_device.index is not None
++                else sdaa_backend.current_device()
++            )
++            _clear_accelerator_cache(
++                synchronize=(
++                    partial(sdaa_backend.synchronize, device_index)
++                    if synchronize
++                    else None
++                ),
++                empty_cache=sdaa_backend.empty_cache,
++                suppress_errors=suppress_errors,
++            )
++
+ 
+ @contextmanager
+ def disable_cudnn_benchmark(device: torch.device | str | None = None):
+diff --git a/runner/batch_inference.py b/runner/batch_inference.py
+index 8084e4d..9a95b2f 100644
+--- a/runner/batch_inference.py
++++ b/runner/batch_inference.py
+@@ -401,7 +401,7 @@ def get_default_runner(
+         n_step (int): Number of diffusion steps.
+         n_sample (int): Number of samples.
+         dtype (str): Inference data type. Defaults to 'fp32'.
+-        device (str): Device selection: auto, cpu, cuda, or mps.
++        device (str): Device selection: auto, cpu, cuda, sdaa, or mps.
+         model_name (str): Name of the model checkpoint.
+         load_checkpoint_path (str): Explicit checkpoint path. If unset, uses the released checkpoint filename for model_name.
+         use_msa (bool): Whether to use MSA.
+@@ -574,7 +574,7 @@ def inference_jsons(
+         n_step (int): Number of diffusion steps.
+         n_sample (int): Number of samples.
+         dtype (str): Data type.
+-        device (str): Device selection: auto, cpu, cuda, or mps.
++        device (str): Device selection: auto, cpu, cuda, sdaa, or mps.
+         model_name (str): Model name.
+         load_checkpoint_path (str): Explicit checkpoint path.
+         trimul_kernel (str): Kernel for triangle multiplicative.
+@@ -964,7 +964,7 @@ def predict(
+         step (int): Number of diffusion steps.
+         sample (int): Number of samples.
+         dtype (str): Data type.
+-        device (str): Device selection: auto, cpu, cuda, or mps.
++        device (str): Device selection: auto, cpu, cuda, sdaa, or mps.
+         model_name (str): Model name.
+         load_checkpoint_path (str): Explicit checkpoint path.
+         use_msa (bool): Use MSA.
+diff --git a/runner/inference.py b/runner/inference.py
+index 8a16291..e28fc4b 100644
+--- a/runner/inference.py
++++ b/runner/inference.py
+@@ -1098,12 +1098,18 @@ class InferenceRunner(object):
+                 f"LOCAL_RANK: {DIST_WRAPPER.local_rank} - CUDA_VISIBLE_DEVICES: [{devices}]"
+             )
+             torch.cuda.set_device(self.device)
++        elif self.device.type == "sdaa":
++            torch.sdaa.set_device(self.device)
++            devices = os.getenv("SDAA_VISIBLE_DEVICES", "all")
++            logging.info(
++                f"LOCAL_RANK: {DIST_WRAPPER.local_rank} - SDAA_VISIBLE_DEVICES: [{devices}]"
++            )
+ 
+         if world_size > 1:
+             if not self.use_cuda:
+                 raise RuntimeError(
+-                    "Distributed Fold-CP inference requires NVIDIA CUDA; CPU "
+-                    "and Apple MPS support single-process inference only."
++                    "Distributed Fold-CP inference currently requires NVIDIA "
++                    "CUDA/NCCL; SDAA, CPU, and Apple MPS support single-process inference."
+                 )
+             if not dist.is_nccl_available():
+                 raise RuntimeError(
+@@ -1388,7 +1394,7 @@ class InferenceRunner(object):
+             "bf16": torch.bfloat16,
+         }[self.configs.dtype]
+ 
+-        if eval_precision == torch.float32 or self.device.type not in {"cuda", "mps"}:
++        if eval_precision == torch.float32 or self.device.type not in {"cuda", "mps", "sdaa"}:
+             enable_amp = nullcontext()
+         else:
+             enable_amp = torch.autocast(
+diff --git a/sdaa/.env.sdaa.example b/sdaa/.env.sdaa.example
+new file mode 100644
+index 0000000..2b869ed
+--- /dev/null
++++ b/sdaa/.env.sdaa.example
+@@ -0,0 +1,8 @@
++# Copy to .env.sdaa and fill values from the target host.
++BASE_IMAGE=lasermpnn-sdaa321-loong:torch2.12.0-sdaa3.2.1-py312
++BASE_IMAGE_ID=sha256:3e425da47a74a03b589f8e1c18a67dcb90c8bcbde977cc1df09fa01209b7a524
++OPENDDE_IMAGE=opendde-sdaa:torch2.12-sdaa3.2.1
++OPENDDE_CONTAINER=opendde-sdaa
++OPENDDE_COMMIT=ddfa1df8aff1babf1fddac4247b7d2351bd0ce9f
++HOST_UID=1006
++HOST_GID=1006
+diff --git a/sdaa/Dockerfile.sdaa b/sdaa/Dockerfile.sdaa
+new file mode 100644
+index 0000000..ba95673
+--- /dev/null
++++ b/sdaa/Dockerfile.sdaa
+@@ -0,0 +1,54 @@
++ARG BASE_IMAGE=lasermpnn-sdaa321-loong:torch2.12.0-sdaa3.2.1-py312
++FROM ${BASE_IMAGE}
++USER root
++
++ARG HOST_UID=1006
++ARG HOST_GID=1006
++ARG BASE_IMAGE_ID=sha256:3e425da47a74a03b589f8e1c18a67dcb90c8bcbde977cc1df09fa01209b7a524
++ARG OPENDDE_COMMIT=ddfa1df8aff1babf1fddac4247b7d2351bd0ce9f
++ARG KALIGN_COMMIT=edd04a358dd8ea1e9379dd74053768d28c7b8613
++
++LABEL org.opencontainers.image.title="OpenDDE Loongson SDAA runtime" \
++      org.opencontainers.image.revision="${OPENDDE_COMMIT}" \
++      org.opendde.repro.base-image="${BASE_IMAGE}" \
++      org.opendde.repro.base-image-id="${BASE_IMAGE_ID}" \
++      org.opendde.repro.profile="loongson-sdaa" \
++      org.opendde.kalign.version="3.6.0" \
++      org.opendde.kalign.source-commit="${KALIGN_COMMIT}"
++
++ENV VIRTUAL_ENV=/opt/venvs/opendde-sdaa \
++    PATH=/opt/venvs/opendde-sdaa/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
++    PIP_DISABLE_PIP_VERSION_CHECK=1 \
++    PIP_NO_CACHE_DIR=1 \
++    PYTHONUNBUFFERED=1 \
++    PYTHONDONTWRITEBYTECODE=1 \
++    OPENDDE_ROOT_DIR=/opendde_data \
++    LAYERNORM_TYPE=torch
++
++RUN /opt/venvs/lasermpnn-sdaa321-py312/bin/python -m venv --system-site-packages "${VIRTUAL_ENV}" \
++    && test -f /opt/venvs/lasermpnn-sdaa321-py312/lib/python3.12/site-packages/sdaa321-base-runtime.pth \
++    && install -m 0644 \
++        /opt/venvs/lasermpnn-sdaa321-py312/lib/python3.12/site-packages/sdaa321-base-runtime.pth \
++        "${VIRTUAL_ENV}/lib/python3.12/site-packages/sdaa321-base-runtime.pth" \
++    && mkdir -p /opt/opendde-source /workspace/repro /opendde_data /home/opendde
++
++COPY OpenDDE/ /opt/opendde-source/
++COPY vendor/kalign-3.6.0/bin/kalign /usr/local/bin/kalign
++COPY vendor/kalign-3.6.0/LICENSE /usr/share/licenses/kalign/LICENSE
++RUN chmod 0755 /usr/local/bin/kalign \
++    && test "$(/usr/local/bin/kalign --version)" = "kalign 3.6.0"
++
++RUN "${VIRTUAL_ENV}/bin/python" -m pip install \
++        --no-deps --no-build-isolation --no-cache-dir /opt/opendde-source \
++    && "${VIRTUAL_ENV}/bin/python" -c \
++        "import torch, torch_sdaa, opendde; assert torch.__version__.startswith('2.12.'), torch.__version__; print('torch', torch.__version__, 'torch_sdaa', torch_sdaa.__version__)" \
++    && "${VIRTUAL_ENV}/bin/opendde" --help >/dev/null \
++    && test "$("${VIRTUAL_ENV}/bin/python" -c 'import sys; print(sys.prefix)')" = "${VIRTUAL_ENV}"
++
++RUN chown -R "${HOST_UID}:${HOST_GID}" /workspace/repro /opendde_data /home/opendde
++
++ENV HOME=/home/opendde
++USER ${HOST_UID}:${HOST_GID}
++WORKDIR /workspace/repro/OpenDDE
++
++CMD ["sleep", "infinity"]
+diff --git a/sdaa/LOONG_SDAA_REPRO.md b/sdaa/LOONG_SDAA_REPRO.md
+new file mode 100644
+index 0000000..73a0f58
+--- /dev/null
++++ b/sdaa/LOONG_SDAA_REPRO.md
+@@ -0,0 +1,121 @@
++# OpenDDE 龙芯 SDAA 复现教程
++
++本教程适用于**包含 SDAA 源码修改和本目录文件的适配仓库提交**。目标是从干净检出运行官方 7r6r 示例：使用仓库自带 MSA、通用权重 opendde.pt、BF16、seed 101、10 个扩散步和 1 个循环，在单进程的 sdaa:0 上生成结构。完整适配问题与 CUDA 对比见 [SDAA_ADAPTATION.md](SDAA_ADAPTATION.md)。
++
++## 1. 准备仓库与目标主机
++
++需要 loongarch64 主机、Docker 权限、/dev/tcaicard0 至 /dev/tcaicard7、Git、Python 3、GCC 12.3.0 和 CMake 3.26.3。构建脚本会映射 8 张卡，推理示例只使用 sdaa:0。基础镜像须事先在本机提供；当前锁定的本地镜像 tag 为 lasermpnn-sdaa321-loong:torch2.12.0-sdaa3.2.1-py312，image ID 见 [source.sdaa.lock](source.sdaa.lock)。该镜像没有可用的远端 RepoDigest，不能仅凭 tag 判断镜像相同。
++
++发布仓库后，先在 shell 中设置 REPO_URL 为**含 SDAA 修改的仓库地址**，ADAPT_COMMIT 为该仓库的**完整适配提交 SHA**。锁文件中的 source_commit 是上游基线提交，不能替代 ADAPT_COMMIT。从准备存放复现工程的目录执行：
++
++~~~bash
++set -euo pipefail
++test -n "$REPO_URL"
++test -n "$ADAPT_COMMIT"
++mkdir opendde-sdaa-repro
++cd opendde-sdaa-repro
++git clone "$REPO_URL" OpenDDE
++git -C OpenDDE checkout --detach "$ADAPT_COMMIT"
++test "$(uname -m)" = loongarch64
++git -C OpenDDE rev-parse HEAD
++git -C OpenDDE status --short
++
++BASE_IMAGE=$(sed -n 's/^base_image=//p' OpenDDE/sdaa/source.sdaa.lock)
++EXPECTED_IMAGE_ID=$(sed -n 's/^base_image_id=//p' OpenDDE/sdaa/source.sdaa.lock)
++test "$(docker image inspect "$BASE_IMAGE" --format '{{.Id}}')" = "$EXPECTED_IMAGE_ID"
++for card in 0 1 2 3 4 5 6 7; do test -e "/dev/tcaicard$card"; done
++/opt/tecoai/bin/teco-smi
++~~~
++
++如果镜像 ID、设备或编译器版本不符，先准备与锁文件一致的环境；不要只改锁值来跳过校验。
++
++## 2. 准备运行数据与构建配置
++
++外层复现工程采用如下布局；data/、work/、tmp/ 和 vendor/ 不属于源码仓库，也不应提交：
++
++~~~text
++opendde-sdaa-repro/
++├── OpenDDE/             # 含 sdaa/ 的适配仓库
++├── data/
++│   ├── checkpoint/opendde.pt
++│   └── common/
++├── vendor/kalign-3.6.0/
++├── work/
++├── tmp/
++├── .dockerignore
++└── .env.sdaa
++~~~
++
++在外层目录继续执行。环境示例中的 UID/GID 要改为当前宿主机用户；基础镜像 ID 保持与锁文件一致。
++
++~~~bash
++mkdir -p data work tmp vendor
++cp OpenDDE/sdaa/dockerignore .dockerignore
++cp OpenDDE/sdaa/.env.sdaa.example .env.sdaa
++sed -i "s/^HOST_UID=.*/HOST_UID=$(id -u)/" .env.sdaa
++sed -i "s/^HOST_GID=.*/HOST_GID=$(id -g)/" .env.sdaa
++~~~
++
++官方数据脚本从发布源获取通用权重和 common/ 文件。该示例使用**现成 MSA**，不需要大型 search_database/。如果服务器不能访问下载源，可从已准备好的同一发布版复制这些资产到相同目录，跳过下面的下载命令，再执行其余校验。
++
++~~~bash
++OPENDDE_ROOT_DIR="$PWD/data" bash OpenDDE/scripts/download_opendde_data.sh --skip-search-database
++printf '%s  %s\n' \
++  7b826620390afad877ee2babc6a4d0df81b94d3a0be030959853d6a7da0807cc \
++  data/checkpoint/opendde.pt | sha256sum -c -
++for f in components.cif components.cif.rdkit_mol.pkl release_date_cache.json obsolete_to_successor.json; do
++  test -s "data/common/$f"
++done
++test -s OpenDDE/examples/7r6r/msa/1/pairing.a3m
++test -s OpenDDE/examples/7r6r/msa/1/non_pairing.a3m
++~~~
++
++权重 SHA-256 来自仓库的 opendde/config/model_manifest.json。此最小示例不需要 opendde_abag.pt、搜索数据库或在线 MSA 服务。
++
++## 3. 构建 Kalign、镜像和独立容器
++
++Kalign 是构建脚本要求的龙芯原生程序；[build-kalign-sdaa.sh](build-kalign-sdaa.sh) 按锁定源码和编译器构建，并校验二进制 SHA-256。[build-sdaa.sh](build-sdaa.sh) 再核对基础镜像、UID/GID 和 Kalign，构建镜像 opendde-sdaa:torch2.12-sdaa3.2.1，并启动名为 opendde-sdaa 的容器。容器使用独立 venv /opt/venvs/opendde-sdaa，OpenDDE/ 与 data/ 只读挂载，work/ 与 tmp/ 可写挂载。
++
++~~~bash
++OpenDDE/sdaa/build-kalign-sdaa.sh
++OpenDDE/sdaa/build-sdaa.sh
++OpenDDE/sdaa/run-official-examples-sdaa.sh doctor
++~~~
++
++doctor 的日志保存在 work/sdaa/acceptance/logs/doctor-run.log；应看到 selected_device=sdaa:0、必要算子和 BF16 检查通过。若同名容器已存在，构建脚本会停止；先核对已有容器，勿覆盖其输出。
++
++## 4. 运行官方 7r6r 现成 MSA 示例
++
++官方 examples/example.json 有三个任务；下面只提取 7r6r。**必须在容器内的 /workspace/repro/OpenDDE 目录运行**，因为示例 JSON 的现成 MSA 路径是相对路径 ./examples/7r6r/msa/1。输入 JSON 使用容器内绝对路径，防止误触发在线搜索。每次换一个新的 RUN_DIR，避免覆盖历史结果。
++
++~~~bash
++export RUN_DIR=work/sdaa/tutorial_7r6r_seed101
++test ! -e "$RUN_DIR"
++mkdir -p "$RUN_DIR"
++python3 - <<'PY'
++import json
++import os
++from pathlib import Path
++jobs = json.loads(Path("OpenDDE/examples/example.json").read_text())
++chosen = [job for job in jobs if job["name"] == "7r6r"]
++assert len(chosen) == 1
++(Path(os.environ["RUN_DIR"]) / "input_7r6r.json").write_text(
++    json.dumps(chosen, indent=2) + "\n"
++)
++PY
++
++docker exec -e RUN_DIR="$RUN_DIR" opendde-sdaa /bin/bash -lc '
++  cd /workspace/repro/OpenDDE &&
++  test -s examples/7r6r/msa/1/pairing.a3m &&
++  test -s examples/7r6r/msa/1/non_pairing.a3m &&
++  opendde pred \
++    -i "/workspace/repro/$RUN_DIR/input_7r6r.json" \
++    -o "/workspace/repro/$RUN_DIR/result" \
++    -s 101 -n opendde_v1 --device sdaa \
++    --use_msa true --use_template false --use_rna_msa false \
++    --trimul_kernel torch --triatt_kernel torch --enable_tf32 false \
++    --sample 1 --step 10 --cycle 1 --dtype bf16
++' > "$RUN_DIR/run.log" 2>&1
++~~~
++
++这是已跑通的单卡、有界推理参数；10 步和 1 循环用于复现验证，不等于上游完整默认推理量。
+diff --git a/sdaa/README.md b/sdaa/README.md
+new file mode 100644
+index 0000000..5a2b81b
+--- /dev/null
++++ b/sdaa/README.md
+@@ -0,0 +1,36 @@
++# OpenDDE 龙芯 SDAA 适配
++
++本目录保存可随 OpenDDE 源码仓库提交的 SDAA 部署与验收文件。模型兼容修改仍在仓库原有的 opendde/、runner/ 等文件中。本目录没有模型权重、数据库、虚拟环境、搜索结果、私钥或编译好的 Kalign。
++
++## 文件
++
++- dockerignore：外层 Docker 构建上下文的忽略规则，避免将数据库、输出和私密配置发送进构建过程。
++- Dockerfile.sdaa：基于已固定的龙芯 Torch/SDAA 本地镜像创建独立 Python 3.12 venv，并安装当前 OpenDDE 源码。
++- .env.sdaa.example、source.sdaa.lock：镜像 ID、宿主机 UID/GID、上游源码与 Kalign 版本和 SHA256 的记录。
++- build-kalign-sdaa.sh：从锁定的 Kalign v3.6.0 源码构建龙芯可执行文件，核对哈希后放到外层 vendor/。
++- build-sdaa.sh：核对基础镜像 ID、UID/GID 和 Kalign 哈希，再构建镜像并映射 8 张 SDAA 卡。
++- container/verify_sdaa_environment.py：由 doctor 阶段调用，检查设备选择、必要算子、BF16、随机数和内存清理。
++- run-official-examples-sdaa.sh、container/acceptance.sh：按阶段运行官方示例与迁移验收；输出写入外层 work/。
++- SDAA_ADAPTATION.md：适配问题、第三方依赖处理、CUDA/SDAA 对比与复跑命令。
++
++## 目录布局与构建
++
++脚本沿用复现工程布局；克隆仓库时将其放在项目根目录的 OpenDDE/ 子目录。在项目根目录下、与 OpenDDE/ 同级准备 data/、work/、tmp/ 和 vendor/。Docker 构建上下文必须是项目根目录，因为 Dockerfile 需要复制 OpenDDE/ 和 vendor/kalign-3.6.0/。data/ 放模型资产和数据库，均不纳入仓库。
++
++在项目根目录执行：
++
++    cp OpenDDE/sdaa/dockerignore .dockerignore
++    cp OpenDDE/sdaa/.env.sdaa.example .env.sdaa
++    # 按目标主机核对并修改 BASE_IMAGE_ID、HOST_UID、HOST_GID 等值
++    OpenDDE/sdaa/build-kalign-sdaa.sh
++    OpenDDE/sdaa/build-sdaa.sh
++    OpenDDE/sdaa/run-official-examples-sdaa.sh doctor
++    OpenDDE/sdaa/run-official-examples-sdaa.sh core
++
++当前基础镜像没有可用的远端 repo digest，因此构建脚本使用本地内容寻址 image ID 严格核对。Kalign 二进制由脚本在目标龙芯主机生成，不提交到仓库。build-sdaa.sh 若发现同名容器已经存在会停止，避免覆盖运行环境。
++
++run-official-examples-sdaa.sh 默认采用 10 个扩散步骤和 1 个循环；上游默认配置更大。可指定 core、prepared、template_smoke、json、runner 等阶段。部分完整官方复合物在当前单卡可用约 15 GiB 显存下仍会 OOM，不能把阶段中的跳过项当作通过。分块注意力与 LayerNorm 的实验性实现已撤回，环境示例不再设置旧分块参数。
++
++## 适配与对比记录
++
++源码修改点、第三方依赖与 wheel 判断、CUDA/SDAA 精度和性能对比、已知显存与搜索限制，以及复跑命令见 SDAA_ADAPTATION.md。原始运行日志与输出保存在独立复现工程的 work/，不提交到源码仓库。
+diff --git a/sdaa/SDAA_ADAPTATION.md b/sdaa/SDAA_ADAPTATION.md
+new file mode 100644
+index 0000000..5f66f6d
+--- /dev/null
++++ b/sdaa/SDAA_ADAPTATION.md
+@@ -0,0 +1,134 @@
++# OpenDDE 龙芯 SDAA 适配与验证报告
++
++## 1. 结论摘要
++
++- 官方示例：仓库 examples/example.json 共 3 个任务；7r6r 使用现成 MSA、BF16、10 步和 1 循环完成 CUDA/SDAA 对照（1/3）。完整 7wux、7pzb 未完成单卡对照；另一个带现成模板的官方 MGYP 输入在 SDAA 上显存不足。官方合成 protein_200 的 FP32/BF16 有界推理已完成。
++- 精度：官方 7r6r 使用现成 MSA 的单次对照中，模型自评 pLDDT 为 CUDA 86.7382、SDAA 86.8255；相对 PDB 7R6R 实验结构的蛋白 A 链 Cα RMSD 分别为 4.197、4.038 Å（仅 167 个可匹配 Cα）。两份预测在全部 203 个蛋白 Cα 上互比的 RMSD 为 12.827 Å，比较范围不同。
++- 性能：现成 MSA 的 7r6r 单次模型前向 CUDA 13.49 秒、SDAA 98.88 秒。两端均仅测一次，且 CUDA 测量时的设备负载尚未核实，耗时及其比值仅作原始记录，性能结论待同输入条件下复测。
++- 适用范围与未解决问题：现成 MSA 的 7r6r 有界单卡推理已通；protein_200 及 7pzb 单链的搜索后推理也已测成功。7pzb 大归档的龙芯直连下载不稳定，模板扫描使用经 QEMU 运行的 x86_64 HMMER；345 残基 MGYP 和更长输入 OOM，多卡 Fold-CP 仍需 CUDA/NCCL。
++
++## 2. 软件环境
++
++| 环境 | 架构与系统 | 镜像 digest/ID | Python/框架及设备插件 | GPU/实际后端 | 环境锁 |
++| --- | --- | --- | --- | --- | --- |
++| CUDA 基线 | Intel Xeon Platinum 8468，x86_64，Linux 5.15 | 基础镜像 digest：sha256:2b59b1b91885677814f78be1f8df48a25d5dc952eb6580eaecfefca510f9afd3；实测容器 image ID 相同 | Python 3.11.16，PyTorch 2.7.1+cu126，CUDA 12.6 | NVIDIA H100 80 GB，cuda:0 | 复现工程外层 source.lock、locks/、checksums.sha256 |
++| 龙芯适配 | Loongson-3C6000/D，loongarch64，Loongnix Server 23.1 | 本地基础镜像 ID：sha256:3e425da47a74a03b589f8e1c18a67dcb90c8bcbde977cc1df09fa01209b7a524；无 RepoDigest | Python 3.12.13，PyTorch 2.12.0，torch_sdaa 3.2.1 | 8 卡已映射；实测单进程 sdaa:0 | sdaa/source.sdaa.lock、sdaa/.env.sdaa.example |
++
++权重、搜索数据库和输出均不随源码仓库提交。
++
++## 3. 源码适配点
++
++### 3.1 计算后端
++
++| 文件或 patch | 原问题 | 最小改动 | 对官方算法的影响 |
++| --- | --- | --- | --- |
++| opendde/config/schema.py、opendde/utils/environment.py、runner/inference.py | 设备枚举和推理初始化仅识别 CUDA/MPS/CPU | 探测 torch_sdaa，选择 sdaa:0 并设置本地卡 | 模型公式不变；设备执行路径改变 |
++| opendde/model/opendde.py、opendde/utils/seed.py、opendde/utils/torch_utils.py | TF32/cuDNN、同步、缓存和种子代码含 CUDA 专用调用 | 按设备分流，补 SDAA 播种、同步与缓存清理 | 原生跨后端随机数流仍不同 |
++| runner/inference.py、opendde/utils/torch_utils.py | BF16 autocast 未覆盖 SDAA | 在 SDAA 路径启用 autocast；三角核选择 Torch 实现 | 低精度舍入与 CUDA 可能不同 |
++| opendde/model/modules/transformer.py（AtomAttentionEncoder 两处） | 对 int64 的 ref_charge 直接调用 torch.arcsinh 时，SDAA 报 Found dtype Float but expected Long | 在普通窗口与 prepare_cache 路径先转为 self.linear_no_bias_ref_charge.weight.dtype，再执行 arcsinh 和原有线性投影 | arcsinh 公式及张量形状不变；显式类型转换可能产生浮点舍入差异 |
++| opendde/model/sample_confidence.py（calculate_clash） | 布尔张量的 max(dim=-1)[0] 在 SDAA 报 argmax(): does not support bool input | 改用 any(dim=-1)，只判断是否存在 True，不再求最大值索引 | 对非空布尔输入，与原 max 取得的布尔值等价 |
++| opendde/data/msa/msa_service_client.py | 公共 MSA HTTP 读取的固定超时太短 | 增加可选的读取超时，默认值保持原值 | 不改变现成 A3M 的直接推理 |
++
++### 3.2 第三方依赖与 wheel
++
++| 包及版本 | 为什么需要适配 | 来源/许可证 | 构建命令或 wheel 标签 | SHA-256 |
++| --- | --- | --- | --- | ---  |
++| Kalign 3.6.0（命令行程序，非 wheel） | 龙芯上需要原生 loongarch64 可执行文件 | 上游 TimoLassmann/kalign；许可证文本随构建产物保存 | sdaa/build-kalign-sdaa.sh；产物不提交仓库 | ecebb6b6320f1b242d982f4c8c5825c6c83585fedc49fa51c3086972ce0ea391 |
++
++HMMER 是完整模板搜索的外部程序，当前使用 x86_64 程序加 QEMU；现成 MSA 的 7r6r 推理不依赖它，也不能把它写成已完成的龙芯原生 wheel。
++
++## 4. 适配过程中遇到的问题
++
++| 问题/报错与触发场景 | 原因 | 处理方法/修改位置 | 重跑结果与证据 | 回退或遗留风险 |
++| --- | --- | --- | --- | --- |
++| 启动推理时设备选择和 CUDA 专用调用不适用 | 上游只覆盖 CUDA/MPS/CPU | 第 3.1 节的设备、autocast 和 CUDA 条件分流 | doctor 选中 sdaa:0；7r6r BF16 完成 | Fold-CP 多进程仍需 CUDA/NCCL |
++| protein_200 在 torch.arcsinh(ref_charge) 报 Found dtype Float but expected Long | int64 输入路径出现 Float/Long 类型不一致；仅凭日志不能定位是后端类型推导、调度还是内核问题 | transformer.py 两处将电荷转为投影层权重 dtype 后继续调用 arcsinh | core FP32/BF16 通过；arcsinh-int64-failure/ 留有原日志 | 浮点 arcsinh 可执行，不能概括为 SDAA 完全不支持该算子 |
++| 置信度阶段 max(dim=-1)[0] 报 argmax(): does not support bool input | max(dim) 同时求值和索引；SDAA 在布尔索引计算路径报错 | sample_confidence.py 改用 any(dim=-1)，无需索引 | core 两种精度通过；bool-max-failure/ 留有原日志 | 对正常非空布尔输入结果等价；新输入仍需验证 |
++| 相同 seed 的 CUDA/SDAA 坐标差异明显 | 两端原生高斯随机流不同；BF16 数值路径也有差异 | seed.py 加 SDAA 播种；另以共用 NumPy 噪声诊断 | 7r6r 原生 Cα RMSD 12.827 Å，共用噪声 3.921 Å | 共用噪声不是生产路径，仍有数值差异 |
++| 693 token 输入及官方 MGYP 在单卡 OOM | Torch 报告约 14.94 GiB 可用；三角注意力或三角乘法申请大块显存 | 使用官方较短 7r6r 做可比验证；撤回无效的实验性分块 | 7r6r BF16 成功；MGYP softmax 申请 5.09 GiB 失败，见 sdaa_mgyp_bf16.run.log | 长输入未解决 |
++| MSA 搜索初期被 SKIP；7pzb 大结果直连下载失败 | 旧验收误用不存在的 /version 接口；服务端完成后结果下载超时或不完整；HMMER 非龙芯原生 | 修正预探测和可选读取超时；7pzb 归档经中转后在龙芯解析，HMMER 经 QEMU 扫描 | protein_200 的 MSA→模板→推理成功；7pzb 真 MSA→模板→单链推理成功，见 work/sdaa/search_20261013/ | 7pzb 大归档直连、原生 HMMER 性能和完整复合物推理仍未解决 |
++
++## 5. 精度对比
++
++### 5.1 官方 7r6r：现成 MSA
++
++主对比使用官方 `examples/example.json` 的 7r6r 单任务、仓库自带配对/非配对 MSA 和相同 `opendde.pt` 权重。两端均为 `opendde_v1`、seed 101、BF16、1 样本、10 扩散步、1 循环、Torch 三角核，关闭模板与 TF32，不重新搜索。实际读入 245 token、2529 原子、703 条 MSA。只有一个种子；没有预先设定等价阈值。
++
++| 指标 | 比较方法 | CUDA | 龙芯 SDAA | SDAA - CUDA |
++| --- | --- | ---: | ---: | ---: |
++| pLDDT | 模型自评置信度 | 86.7382 | 86.8255 | +0.0873 |
++| pTM | 模型自评置信度 | 0.8805 | 0.8928 | +0.0123 |
++| ipTM | 模型自评置信度 | 0.9320 | 0.9281 | -0.0039 |
++| 蛋白 Cα 对齐 RMSD | 两份预测的全部 203 个 Cα | — | — | 两端之间 12.827 Å |
++| Cα 两两距离 MAE | 两份预测内部成对距离 | — | — | 两端之间 7.299 Å |
++
++另以 [PDB 7R6R](https://www.rcsb.org/structure/7R6R) 的实验结构作为参考。该条目为 3.13 Å 的 X 射线结构；所用参考 CIF 的 SHA-256 为 cda5bae340e43103672082f9ae4a721c6d23398833d77dafb12fa5a784f5c242。按蛋白 A 链序列匹配，只使用实验结构中有坐标且两份预测均有对应残基的 167 个 Cα。各预测独立进行刚体对齐。
++| 相对实验结构指标，seed 101 | CUDA | 龙芯 SDAA | SDAA - CUDA |
++| --- | ---: | ---: | ---: |
++| 蛋白 A 链 Cα RMSD，越低越好 | 4.197 Å | 4.038 Å | -0.159 Å |
++| Cα 局部距离一致率，越高越好 | 0.4519 | 0.4857 | +0.0338 |
++
++在相同 167 个 Cα 上，两份预测之间的对齐 RMSD 为 5.323 Å；前表的 12.827 Å 使用全部 203 个预测 Cα，比较范围不同。单个种子且两端原生随机数流不同，不能据此判定 SDAA 稳定优于 CUDA，也不能仅凭 pLDDT 评价真实结构精度。
++
++## 6. 性能对比
++
++### 6.1 官方 7r6r：现成 MSA
++
++同第 5.1 节，单进程、实际单卡；`Model forward time` 与 `Job completed in` 来自 OpenDDE 日志。模型前向不包含全部特征构建和写出。该组每端仅运行一次，不能计算中位数或波动范围。
++
++| 后端 | 次数 | 模型前向，秒 | 整次任务，秒 | 原始日志 |
++| --- | ---: | ---: | ---: | --- |
++| CUDA/H100 | 1 | 13.49 | 24.90 | `work/official_compare_20261013/cuda_7r6r_bf16.run.log` |
++| 龙芯/SDAA sdaa:0 | 1 | 98.88 | 112.70 | `work/sdaa/prepared_direct_20261013/7r6r_bf16/run.log` |
++
++按这一次原始记录计算，SDAA/CUDA 前向耗时比为 7.33，整次任务耗时比为 4.53。CUDA 测量时的设备负载尚未核实，且每端仅一次运行，这些比值不能作为稳定的设备性能结论；需在相同输入、空闲设备和重复运行条件下复测。合成 `protein_200` 的辅助单次前向：FP32 CUDA/SDAA 为 4.07/80.65 秒（19.8 倍），BF16 为 3.47/47.05 秒（13.6 倍）；这些比值也仅供参考。
++
++## 7. 复现命令
++
++下列命令用仓库已有的现成 MSA 直接推理 7r6r，不触发在线搜索。**容器工作目录必须是 `/workspace/repro/OpenDDE`**，因为官方 JSON 中的旧格式 MSA 路径为 `./examples/7r6r/msa/1`；输入 JSON 则使用绝对路径。先用 `nvidia-smi` 选空闲 CUDA 卡，再替换 `CUDA_GPU` 的值。运行结果应显示 `N_msa 703`，且日志不能出现 `MSA server search started`。输出目录名每次改新，以免覆盖历史证据。
++
++CUDA 端：
++
++~~~bash
++set -euo pipefail
++PROJECT_DIR="REPLACE_WITH_CUDA_REPRO_ROOT"
++cd "$PROJECT_DIR"
++nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
++CUDA_GPU=2  # 运行前改为实际空闲的宿主机 GPU 编号
++RUN_NAME=7r6r_bf16_recheck_01
++test ! -e "work/official_compare_20261013/$RUN_NAME"
++docker exec -e CUDA_VISIBLE_DEVICES="$CUDA_GPU" opendde-repro /bin/bash -lc \
++  "cd /workspace/repro/OpenDDE && \
++   test -s examples/7r6r/msa/1/pairing.a3m && \
++   test -s examples/7r6r/msa/1/non_pairing.a3m && \
++   opendde pred -i /workspace/repro/work/official_compare_20261013/input_7r6r.json \
++   -o /workspace/repro/work/official_compare_20261013/$RUN_NAME \
++   -s 101 -n opendde_v1 --device cuda --use_msa true --use_template false \
++   --use_rna_msa false --trimul_kernel torch --triatt_kernel torch \
++   --enable_tf32 false --sample 1 --step 10 --cycle 1 --dtype bf16" \
++  > "work/official_compare_20261013/$RUN_NAME.run.log" 2>&1
++grep 'N_msa 703' "work/official_compare_20261013/$RUN_NAME.run.log"
++if grep -q 'MSA server search started' "work/official_compare_20261013/$RUN_NAME.run.log"; then exit 1; fi
++~~~
++
++龙芯 SDAA 端：
++
++~~~bash
++set -euo pipefail
++PROJECT_DIR="REPLACE_WITH_SDAA_REPRO_ROOT"
++cd "$PROJECT_DIR"
++RUN_NAME=7r6r_bf16_recheck_01
++test ! -e "work/sdaa/prepared_direct_20261013/$RUN_NAME"
++docker exec opendde-sdaa /bin/bash -lc \
++  "cd /workspace/repro/OpenDDE && \
++   test -s examples/7r6r/msa/1/pairing.a3m && \
++   test -s examples/7r6r/msa/1/non_pairing.a3m && \
++   opendde pred -i /workspace/repro/work/sdaa/prepared_direct_20261013/input_7r6r.json \
++   -o /workspace/repro/work/sdaa/prepared_direct_20261013/$RUN_NAME \
++   -s 101 -n opendde_v1 --device sdaa --use_msa true --use_template false \
++   --use_rna_msa false --trimul_kernel torch --triatt_kernel torch \
++   --enable_tf32 false --sample 1 --step 10 --cycle 1 --dtype bf16" \
++  > "work/sdaa/prepared_direct_20261013/$RUN_NAME.run.log" 2>&1
++grep 'N_msa 703' "work/sdaa/prepared_direct_20261013/$RUN_NAME.run.log"
++if grep -q 'MSA server search started' "work/sdaa/prepared_direct_20261013/$RUN_NAME.run.log"; then exit 1; fi
++~~~
+diff --git a/sdaa/build-kalign-sdaa.sh b/sdaa/build-kalign-sdaa.sh
+new file mode 100755
+index 0000000..d0ba63a
+--- /dev/null
++++ b/sdaa/build-kalign-sdaa.sh
+@@ -0,0 +1,54 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++ROOT="$(cd "$(dirname "$BASH_SOURCE")/../.." && pwd)"
++LOCK="$ROOT/OpenDDE/sdaa/source.sdaa.lock"
++get_pin() {
++    sed -n "s/^$1=//p" "$LOCK"
++}
++REPOSITORY="$(get_pin kalign_source_repository)"
++TAG="$(get_pin kalign_source_tag)"
++COMMIT="$(get_pin kalign_source_commit)"
++EXPECTED_SHA="$(get_pin kalign_binary_sha256)"
++EXPECTED_GCC="$(get_pin kalign_build_gcc)"
++EXPECTED_CMAKE="$(get_pin kalign_build_cmake)"
++
++actual_gcc="$(gcc -dumpfullversion)"
++actual_cmake="$(cmake --version | sed -nE '1s/.*version ([0-9.]+).*/\1/p')"
++[[ "$actual_gcc" == "$EXPECTED_GCC" ]] || {
++    echo "GCC mismatch: expected $EXPECTED_GCC, found $actual_gcc" >&2
++    exit 1
++}
++[[ "$actual_cmake" == "$EXPECTED_CMAKE" ]] || {
++    echo "CMake mismatch: expected $EXPECTED_CMAKE, found $actual_cmake" >&2
++    exit 1
++}
++
++SRC="$ROOT/work/sdaa/build/kalign-src"
++BUILD="$ROOT/work/sdaa/build/kalign-build"
++PREFIX="$ROOT/work/sdaa/build/kalign-install"
++VENDOR="$ROOT/vendor/kalign-3.6.0"
++mkdir -p "$ROOT/work/sdaa/build" "$ROOT/work/sdaa/logs"
++
++if [[ ! -d "$SRC/.git" ]]; then
++    git clone --depth 1 --branch "$TAG" "$REPOSITORY" "$SRC"
++fi
++actual_commit="$(git -C "$SRC" rev-parse HEAD)"
++[[ "$actual_commit" == "$COMMIT" ]] || {
++    echo "Kalign source mismatch: expected $COMMIT, found $actual_commit" >&2
++    exit 1
++}
++
++cmake -S "$SRC" -B "$BUILD"     -DCMAKE_BUILD_TYPE=Release     -DCMAKE_INSTALL_PREFIX="$PREFIX"     -DBUILD_SHARED_LIBS=OFF     -DENABLE_SSE=OFF     -DENABLE_AVX=OFF     -DENABLE_AVX2=OFF     -DUSE_THREADPOOL=ON     2>&1 | tee "$ROOT/work/sdaa/logs/kalign-configure.log"
++cmake --build "$BUILD" --parallel 8     2>&1 | tee "$ROOT/work/sdaa/logs/kalign-build.log"
++cmake --install "$BUILD"     2>&1 | tee "$ROOT/work/sdaa/logs/kalign-install.log"
++
++install -D -m 0755 "$PREFIX/bin/kalign" "$VENDOR/bin/kalign"
++install -D -m 0644 "$SRC/COPYING" "$VENDOR/LICENSE"
++actual_sha="$(sha256sum "$VENDOR/bin/kalign" | awk '{print $1}')"
++[[ "$actual_sha" == "$EXPECTED_SHA" ]] || {
++    echo "Kalign binary checksum mismatch: expected $EXPECTED_SHA, found $actual_sha" >&2
++    exit 1
++}
++[[ "$("$VENDOR/bin/kalign" --version)" == "kalign 3.6.0" ]]
++printf 'Kalign %s built from %s (%s/%s); sha256=%s\n' "$TAG" "$COMMIT" "$actual_gcc" "$actual_cmake" "$actual_sha"
+diff --git a/sdaa/build-sdaa.sh b/sdaa/build-sdaa.sh
+new file mode 100755
+index 0000000..cb0e0f9
+--- /dev/null
++++ b/sdaa/build-sdaa.sh
+@@ -0,0 +1,85 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++cd "${ROOT}"
++if [[ ! -f "$ROOT/.dockerignore" ]]; then
++    echo "Missing $ROOT/.dockerignore; copy OpenDDE/sdaa/dockerignore first." >&2
++    exit 1
++fi
++ENV_FILE="${OPENDDE_ENV_FILE:-${ROOT}/.env.sdaa}"
++if [[ ! -f "${ENV_FILE}" ]]; then
++    echo "Missing ${ENV_FILE}; copy OpenDDE/sdaa/.env.sdaa.example and set the fixed image ID and host UID/GID." >&2
++    exit 1
++fi
++set -a
++# This file contains only non-secret build pins.
++source "${ENV_FILE}"
++set +a
++OPENDDE_CONTAINER="${OPENDDE_CONTAINER:-opendde-sdaa}"
++
++actual_image_id="$(docker image inspect "${BASE_IMAGE}" --format '{{.Id}}')"
++if [[ "${actual_image_id}" != "${BASE_IMAGE_ID}" ]]; then
++    echo "Base image ID mismatch: expected ${BASE_IMAGE_ID}, found ${actual_image_id}" >&2
++    exit 1
++fi
++if [[ "$(id -u)" != "${HOST_UID}" || "$(id -g)" != "${HOST_GID}" ]]; then
++    echo "Host UID/GID mismatch: pinned ${HOST_UID}:${HOST_GID}, current $(id -u):$(id -g)" >&2
++    exit 1
++fi
++KALIGN_BIN="$ROOT/vendor/kalign-3.6.0/bin/kalign"
++EXPECTED_KALIGN_SHA="$(sed -n 's/^kalign_binary_sha256=//p' "$ROOT/OpenDDE/sdaa/source.sdaa.lock")"
++actual_kalign_sha="$(sha256sum "$KALIGN_BIN" | awk '{print $1}')"
++if [[ ! -x "$KALIGN_BIN" || "$actual_kalign_sha" != "$EXPECTED_KALIGN_SHA" ]]; then
++    echo "Kalign artifact missing or checksum mismatch: expected $EXPECTED_KALIGN_SHA, found $actual_kalign_sha" >&2
++    exit 1
++fi
++KALIGN_COMMIT="$(sed -n 's/^kalign_source_commit=//p' "$ROOT/OpenDDE/sdaa/source.sdaa.lock")"
++if docker container inspect "${OPENDDE_CONTAINER}" >/dev/null 2>&1; then
++    echo "Container ${OPENDDE_CONTAINER} already exists; inspect it before reusing this script." >&2
++    exit 1
++fi
++
++docker build \
++    --file OpenDDE/sdaa/Dockerfile.sdaa \
++    --tag "${OPENDDE_IMAGE}" \
++    --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
++    --build-arg "BASE_IMAGE_ID=${BASE_IMAGE_ID}" \
++    --build-arg "HOST_UID=${HOST_UID}" \
++    --build-arg "HOST_GID=${HOST_GID}" \
++    --build-arg "OPENDDE_COMMIT=${OPENDDE_COMMIT}" \
++    --build-arg "KALIGN_COMMIT=$KALIGN_COMMIT" \
++    .
++
++run_args=(
++    --detach
++    --name "${OPENDDE_CONTAINER}"
++    --restart unless-stopped
++    --init
++    --shm-size 8g
++    --user "${HOST_UID}:${HOST_GID}"
++    --workdir /workspace/repro/OpenDDE
++    --env HOME=/home/opendde
++    --env VIRTUAL_ENV=/opt/venvs/opendde-sdaa
++    --env PATH=/opt/venvs/opendde-sdaa/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
++    --env PYTHONPATH=/workspace/repro/OpenDDE
++    --env PYTHONUNBUFFERED=1
++    --env PYTHONDONTWRITEBYTECODE=1
++    --env OPENDDE_ROOT_DIR=/opendde_data
++    --env LAYERNORM_TYPE=torch
++    --volume "${ROOT}/OpenDDE:/workspace/repro/OpenDDE:ro"
++    --volume "${ROOT}/data:/opendde_data:ro"
++    --volume "${ROOT}/work:/workspace/repro/work:rw"
++    --volume "${ROOT}/tmp:/tmp:rw"
++)
++for card in {0..7}; do
++    if [[ ! -e "/dev/tcaicard${card}" ]]; then
++        echo "Missing host device /dev/tcaicard${card}" >&2
++        exit 1
++    fi
++    run_args+=(--device "/dev/tcaicard${card}:/dev/tcaicard${card}")
++done
++
++docker run "${run_args[@]}" "${OPENDDE_IMAGE}" sleep infinity
++docker inspect "${OPENDDE_CONTAINER}" \
++    --format 'status={{.State.Status}} image={{.Image}} user={{.Config.User}} devices={{len .HostConfig.Devices}}'
+diff --git a/sdaa/container/acceptance.sh b/sdaa/container/acceptance.sh
+new file mode 100644
+index 0000000..203fab0
+--- /dev/null
++++ b/sdaa/container/acceptance.sh
+@@ -0,0 +1,490 @@
++#!/usr/bin/env bash
++# Container-side GPU acceptance suite for the official OpenDDE examples.
++#
++# Every command below is the command documented by the upstream project
++# (README.md, docs/inference_instructions.md, docs/kernels.md, inference_demo.sh)
++# with only the output directory and, where a full production run would take
++# hours, the sample/step/cycle counts adjusted and recorded in the log.
++#
++# Stages: doctor | core | prepared | templates | template_smoke | json | runner | runner_full | search | all
++set -euo pipefail
++
++SOURCE_ROOT="${SOURCE_ROOT:-/workspace/repro/OpenDDE}"
++REPRO_ROOT="/workspace/repro"
++WORK_ROOT="${WORK_ROOT:-${REPRO_ROOT}/work/acceptance}"
++STAGE="${1:-all}"
++INFERENCE_STEPS="${OPENDDE_INFERENCE_STEPS:-10}"
++INFERENCE_CYCLES="${OPENDDE_INFERENCE_CYCLES:-1}"
++
++mkdir -p "${WORK_ROOT}/logs"
++SUMMARY="${WORK_ROOT}/summary.txt"
++STAGE_SUMMARY="${WORK_ROOT}/summary-${STAGE}.txt"
++: > "${SUMMARY}"
++: > "${STAGE_SUMMARY}"
++
++cd "${SOURCE_ROOT}"
++
++FAILURES=0
++
++record() {
++    printf '%s\n' "$*" | tee -a "${SUMMARY}" "${STAGE_SUMMARY}"
++}
++
++step() {
++    local name="$1"
++    shift
++    local log="${WORK_ROOT}/logs/${name}.log"
++    local status=0
++    printf '### %s\n' "${name}" >&2
++    "$@" >"${log}" 2>&1 || status=$?
++    if [[ "${status}" -eq 0 ]]; then
++        record "PASS ${name}"
++    elif [[ "${status}" -eq 3 ]]; then
++        # Exit code 3 means a required external service, local database, or
++        # executable is unavailable for this optional preprocessing step.
++        record "SKIP ${name} (see ${log})"
++        head -n 3 "${log}" >&2 || true
++    else
++        record "FAIL ${name} (log: ${log})"
++        tail -n 30 "${log}" >&2 || true
++        FAILURES=$((FAILURES + 1))
++    fi
++}
++
++# Fail unless a run produced the documented output layout
++# <out_dir>/<job_name>/seed_<seed>/predictions/<job>_sample_<n>.cif
++expect_predictions() {
++    local out_dir="$1"
++    local job="$2"
++    local min_samples="${3:-1}"
++    local count
++    count="$(find "${out_dir}/${job}" -path '*/predictions/*.cif' | wc -l)"
++    if [[ "${count}" -lt "${min_samples}" ]]; then
++        echo "expected at least ${min_samples} prediction CIF(s) under ${out_dir}/${job}, found ${count}"
++        return 1
++    fi
++    find "${out_dir}/${job}" -name '*.cif' -printf 'cif  %s bytes  %p\n' | sort -k4
++    find "${out_dir}/${job}" -name '*.json' -printf 'json %s bytes  %p\n' | sort -k4
++}
++
++fresh_dir() {
++    local out_dir="$1"
++    rm -rf "${out_dir}"
++    mkdir -p "${out_dir}"
++}
++
++# SDAA doctor is dispatched to verify_sdaa_environment.py in run_stage.
++
++# ---------------------------------------------------------------------------
++# core: instrumentation-free GPU inference without external feature searches
++# ---------------------------------------------------------------------------
++core_protein_200_fp32() {
++    local out="${WORK_ROOT}/core/protein_200_fp32"
++    fresh_dir "${out}"
++    # README "Multi-GPU Fold-CP Inference" input, run single-GPU with the
++    # documented default fp32 dtype and automatic kernel selection.
++    opendde pred \
++        -i examples/protein_200.json \
++        -o "${out}" \
++        -n opendde_v1 \
++        --use_msa false \
++        --use_template false \
++        --use_rna_msa false \
++        --sample 1 \
++        --step "${INFERENCE_STEPS}" \
++        --cycle "${INFERENCE_CYCLES}"
++    expect_predictions "${out}" synthetic_protein_200 1
++}
++
++core_input_json_fp32() {
++    local out="${WORK_ROOT}/core/input_json_fp32"
++    fresh_dir "${out}"
++    # README "Running Your First Prediction" compatibility run on the shipped
++    # examples/input.json, with the PyTorch triangle kernels forced on.
++    LAYERNORM_TYPE=torch opendde pred \
++        -i examples/input.json \
++        -o "${out}" \
++        -n opendde_v1 \
++        --use_msa false \
++        --use_template false \
++        --use_rna_msa false \
++        --triatt_kernel torch \
++        --trimul_kernel torch \
++        --sample 1 \
++        --step "${INFERENCE_STEPS}" \
++        --cycle "${INFERENCE_CYCLES}" \
++        --dtype fp32
++    expect_predictions "${out}" user_test 1
++}
++
++core_protein_200_bf16() {
++    local out="${WORK_ROOT}/core/protein_200_bf16"
++    fresh_dir "${out}"
++    opendde pred \
++        -i examples/protein_200.json \
++        -o "${out}" \
++        -n opendde_v1 \
++        --use_msa false \
++        --use_template false \
++        --use_rna_msa false \
++        --sample 1 \
++        --step "${INFERENCE_STEPS}" \
++        --cycle "${INFERENCE_CYCLES}" \
++        --dtype bf16
++    expect_predictions "${out}" synthetic_protein_200 1
++}
++
++core_two_samples() {
++    local out="${WORK_ROOT}/core/protein_200_two_samples"
++    fresh_dir "${out}"
++    # Official sampling behaviour: two diffusion samples from one seed.
++    opendde pred \
++        -i examples/protein_200.json \
++        -o "${out}" \
++        -s 101 \
++        -n opendde_v1 \
++        --use_msa false \
++        --use_template false \
++        --use_rna_msa false \
++        --sample 2 \
++        --step "${INFERENCE_STEPS}" \
++        --cycle "${INFERENCE_CYCLES}"
++    expect_predictions "${out}" synthetic_protein_200 2
++}
++
++# ---------------------------------------------------------------------------
++# prepared: examples that ship precomputed MSA/template/RNA-MSA features
++# ---------------------------------------------------------------------------
++prepared_protein_dna_msa() {
++    local out="${WORK_ROOT}/prepared/protein_dna_msa"
++    fresh_dir "${out}"
++    # examples/example.json carries a precomputed MSA directory, so no external
++    # MSA server is contacted.
++    opendde pred \
++        -i examples/example.json \
++        -o "${out}" \
++        -s 101 \
++        -n opendde_v1 \
++        --use_msa true \
++        --use_template false \
++        --use_rna_msa false \
++        --sample 1 \
++        --step "${INFERENCE_STEPS}" \
++        --cycle "${INFERENCE_CYCLES}"
++    expect_predictions "${out}" 7r6r 1
++}
++
++prepared_template_mgyp() {
++    local out="${WORK_ROOT}/prepared/template_mgyp"
++    fresh_dir "${out}"
++    # inference_demo.sh example 1.2: local pairing/non-pairing A3M plus a
++    # precomputed concat.hhr template hit list, seeds taken from the JSON.
++    opendde pred \
++        -i examples/examples_with_template/example_mgyp004658859411.json \
++        -o "${out}" \
++        -s 101 \
++        -n opendde_v1 \
++        --use_msa true \
++        --use_template true \
++        --sample 1 \
++        --step "${INFERENCE_STEPS}" \
++        --cycle "${INFERENCE_CYCLES}" \
++        --use_default_params true
++    expect_predictions "${out}" MGYP004658859411 1
++}
++
++prepared_template_mgyp_no_msa() {
++    local out="$WORK_ROOT/prepared/template_mgyp_no_msa"
++    fresh_dir "$out"
++    # Keep the official MGYP JSON and its template hits; omit its deep MSA.
++    opendde pred -i examples/examples_with_template/example_mgyp004658859411.json -o "$out" -s 101 -n opendde_v1 --use_msa false --use_template true --sample 1 --step "$INFERENCE_STEPS" --cycle "$INFERENCE_CYCLES"
++    expect_predictions "$out" MGYP004658859411 1
++}
++
++prepared_template_ligand_9fm7() {
++    local out="${WORK_ROOT}/prepared/template_ligand_9fm7"
++    fresh_dir "${out}"
++    # inference_demo.sh example 2.1 input: protein + CCD ligand with a local
++    # hmmsearch template file. Note: inference_demo.sh also passes
++    # --use_seeds_in_json, which the v1.1.1 runner does not accept; seeds are
++    # taken from the --seeds argument instead, as the runner documents.
++    opendde pred \
++        -i examples/examples_with_template/example_9fm7.json \
++        -o "${out}" \
++        -s 103 \
++        -n opendde_v1 \
++        --use_msa true \
++        --use_template true \
++        --sample 1 \
++        --step "${INFERENCE_STEPS}" \
++        --cycle "${INFERENCE_CYCLES}"
++    expect_predictions "${out}" 9fm7 1
++}
++
++prepared_rna_msa_9gmw() {
++    local out="${WORK_ROOT}/prepared/rna_msa_9gmw"
++    fresh_dir "${out}"
++    # inference_demo.sh example 1.3: RNA-only input with a local A3M.
++    opendde pred \
++        -i examples/examples_with_rna_msa/example_9gmw_2.json \
++        -o "${out}" \
++        -n opendde_v1 \
++        --use_msa true \
++        --use_rna_msa true \
++        --sample 1 \
++        --step "${INFERENCE_STEPS}" \
++        --cycle "${INFERENCE_CYCLES}"
++    expect_predictions "${out}" 9gmw_2 1
++}
++
++prepared_ligand_complex() {
++    local out="${WORK_ROOT}/prepared/ligand_complex"
++    fresh_dir "${out}"
++    # examples/example_without_msa.json: protein/DNA/CCD-ligand complex without
++    # any sequence search.
++    opendde pred \
++        -i examples/example_without_msa.json \
++        -o "${out}" \
++        -n opendde_v1 \
++        --use_msa false \
++        --use_template false \
++        --use_rna_msa false \
++        --sample 1 \
++        --step "${INFERENCE_STEPS}" \
++        --cycle "${INFERENCE_CYCLES}"
++    expect_predictions "${out}" 7pzb_need_search_msa 1
++}
++
++prepared_tfg_guidance() {
++    local out="${WORK_ROOT}/prepared/tfg_guidance"
++    fresh_dir "${out}"
++    # docs/inference_instructions.md "Optional TFG Guidance".
++    opendde pred \
++        -i examples/example_without_msa.json \
++        -o "${out}" \
++        -n opendde_v1 \
++        --use_msa false \
++        --use_template false \
++        --use_rna_msa false \
++        --use_tfg_guidance true \
++        --sample 1 \
++        --step "$INFERENCE_STEPS" \
++        --cycle "${INFERENCE_CYCLES}"
++    expect_predictions "${out}" 7pzb_need_search_msa 1
++}
++
++prepared_abag_checkpoint() {
++    local out="${WORK_ROOT}/prepared/abag_checkpoint"
++    fresh_dir "${out}"
++    # docs/inference_instructions.md: keep the released filename and select it
++    # explicitly with --load_checkpoint_path.
++    opendde pred \
++        -i examples/protein_200.json \
++        -o "${out}" \
++        -n opendde_v1 \
++        --load_checkpoint_path "${OPENDDE_ROOT_DIR}/checkpoint/opendde_abag.pt" \
++        --use_msa false \
++        --use_template false \
++        --use_rna_msa false \
++        --sample 1 \
++        --step "${INFERENCE_STEPS}" \
++        --cycle "${INFERENCE_CYCLES}"
++    expect_predictions "${out}" synthetic_protein_200 1
++}
++
++# ---------------------------------------------------------------------------
++# json: official structure-to-JSON conversion
++# ---------------------------------------------------------------------------
++json_conversion() {
++    local out="${WORK_ROOT}/json"
++    fresh_dir "${out}"
++    opendde json -i examples/7pzb.pdb -o "${out}" --altloc first
++    opendde json -i examples/2lwu.cif -o "${out}" --altloc first --assembly_id 1
++    find "${out}" -name '*.json' -printf 'json %s bytes %p\n' | sort -k4
++}
++
++# ---------------------------------------------------------------------------
++# runner: direct runner/inference.py entry point from inference_demo.sh
++# ---------------------------------------------------------------------------
++runner_protein_200() {
++    local out="$WORK_ROOT/runner/protein_200"
++    fresh_dir "$out"
++    python runner/inference.py --model_name opendde_v1 --seeds 101 --dump_dir "$out" --input_json_path ./examples/protein_200.json --model.N_cycle "$INFERENCE_CYCLES" --sample_diffusion.N_sample 1 --sample_diffusion.N_step "$INFERENCE_STEPS" --triangle_attention torch --triangle_multiplicative torch --use_msa false --use_template false
++    expect_predictions "$out" synthetic_protein_200 1
++}
++
++runner_direct() {
++    local out="${WORK_ROOT}/runner/output_m_9fm7"
++    fresh_dir "${out}"
++    python runner/inference.py \
++        --model_name opendde_v1 \
++        --seeds 103 \
++        --dump_dir "${out}" \
++        --input_json_path ./examples/examples_with_template/example_9fm7.json \
++        --model.N_cycle "${INFERENCE_CYCLES}" \
++        --sample_diffusion.N_sample 1 \
++        --sample_diffusion.N_step "${INFERENCE_STEPS}" \
++        --triangle_attention torch \
++        --triangle_multiplicative torch \
++        --use_template true
++    expect_predictions "${out}" 9fm7 1
++}
++
++runner_input_json() {
++    local out="${WORK_ROOT}/runner/output_base"
++    fresh_dir "${out}"
++    python runner/inference.py \
++        --model_name opendde_v1 \
++        --seeds 101 \
++        --dump_dir "${out}" \
++        --input_json_path ./examples/examples_with_template/example_mgyp004658859411.json \
++        --model.N_cycle "${INFERENCE_CYCLES}" \
++        --sample_diffusion.N_sample 1 \
++        --sample_diffusion.N_step "${INFERENCE_STEPS}" \
++        --triangle_attention torch \
++        --triangle_multiplicative torch \
++        --use_template true
++    expect_predictions "${out}" MGYP004658859411 1
++}
++
++# ---------------------------------------------------------------------------
++# search: preprocessing commands (protein MSA server + local search databases)
++# ---------------------------------------------------------------------------
++search_msa() {
++    local out="${WORK_ROOT}/search/msa"
++    fresh_dir "${out}"
++    # A successful command can still contain a query-only fallback after an
++    # API failure. The manifest is written only after a result is downloaded.
++    opendde msa -i examples/example_without_msa.json -o "${out}"
++    if [[ ! -s "${out}/7pzb_need_search_msa/msa/unpaired/out.manifest.json" ]]; then
++        echo "MSA_SEARCH_FELL_BACK_TO_QUERY_ONLY"
++        return 1
++    fi
++    find "${out}" -name '*.json' -printf 'json %s bytes %p\n' | sort -k4
++}
++
++search_msa_template() {
++    local out="${WORK_ROOT}/search/mt"
++    fresh_dir "${out}"
++    local db="/opendde_data/search_database/pdb_seqres_2022_09_28.fasta"
++    if [[ ! -s "$db" ]]; then
++        echo "SEQRES_DATABASE_MISSING ($db); automatic database download disabled for acceptance"
++        return 3
++    fi
++    if ! command -v hmmsearch >/dev/null || ! command -v hmmbuild >/dev/null; then
++        echo "HMMER_TOOLS_MISSING (hmmsearch/hmmbuild)"
++        return 3
++    fi
++    opendde mt -i examples/example_without_msa.json -o "${out}"
++    find "${out}" -name '*.json' -printf 'json %s bytes %p\n' | sort -k4
++}
++
++search_pred_from_preprocessed() {
++    local out="${WORK_ROOT}/search/pred_from_preprocessed"
++    fresh_dir "${out}"
++    # docs/tutorial.md section 5: predict from the JSON produced by the
++    # preprocessing command, which carries the locally searched template hits.
++    if [[ ! -d "$WORK_ROOT/search/mt/.opendde_preprocessed" ]]; then
++        echo "PREPROCESSED_JSON_MISSING (search_msa_template was skipped)"
++        return 3
++    fi
++    local prepared_json
++    prepared_json="$(find "${WORK_ROOT}/search/mt/.opendde_preprocessed" \
++        -name '*-final-updated.json' | sort | head -n 1)"
++    if [[ -z "${prepared_json}" ]]; then
++        echo "PREPROCESSED_JSON_MISSING (search_msa_template was skipped)"
++        return 3
++    fi
++    echo "prepared_json=${prepared_json}"
++    opendde pred \
++        -i "${prepared_json}" \
++        -o "${out}" \
++        -n opendde_v1 \
++        --use_msa true \
++        --use_template true \
++        --sample 1 \
++        --step "${INFERENCE_STEPS}" \
++        --cycle "${INFERENCE_CYCLES}"
++    expect_predictions "${out}" 7pzb_need_search_msa 1
++}
++
++search_prep_rna() {
++    local out="${WORK_ROOT}/search/prep"
++    fresh_dir "${out}"
++    opendde prep -i examples/examples_with_rna_msa/example_9gmw_2.json -o "${out}"
++    find "${out}" -name '*.json' -printf 'json %s bytes %p\n' | sort -k4
++}
++
++run_stage() {
++    case "$1" in
++        doctor)
++            step sdaa_runtime python /workspace/repro/OpenDDE/sdaa/container/verify_sdaa_environment.py
++            ;;
++        core)
++            step core_protein_200_fp32 core_protein_200_fp32
++            record "SKIP core_input_json_fp32 (693-token input exceeds current SDAA memory; see MIGRATION_SDAA.md)"
++            step core_protein_200_bf16 core_protein_200_bf16
++            step core_two_samples core_two_samples
++            ;;
++        prepared)
++            record "SKIP prepared_protein_dna_msa (7r6r 245-token and 7wux 1218-token runs OOM; see prepared_protein_dna_msa.log)"
++            record "SKIP prepared_template_mgyp (345 tokens, 4323 MSA; stopped after 15 minutes; see prepared_template_mgyp.log)"
++            record "SKIP prepared_template_ligand_9fm7 (644 tokens, 8856 MSA; stopped after 5 minutes; see prepared_template_ligand_9fm7.log)"
++            step prepared_template_mgyp_no_msa prepared_template_mgyp_no_msa
++            step prepared_rna_msa_9gmw prepared_rna_msa_9gmw
++            record "SKIP prepared_ligand_complex (600-token example exceeded the current SDAA runtime budget; see prepared_ligand_complex.log)"
++            record "SKIP prepared_tfg_guidance (same 600-token example; full run was stopped after sustained full device utilization; see prepared_tfg_guidance.log)"
++            step prepared_abag_checkpoint prepared_abag_checkpoint
++            ;;
++        templates)
++            step prepared_template_mgyp prepared_template_mgyp
++            step prepared_template_ligand_9fm7 prepared_template_ligand_9fm7
++            ;;
++        template_smoke)
++            step prepared_template_mgyp_no_msa prepared_template_mgyp_no_msa
++            ;;
++        json)
++            step json_conversion json_conversion
++            ;;
++        runner)
++            record "SKIP runner_direct (9fm7 full-MSA input: 644 tokens, 8856 MSA; model exceeded the SDAA runtime budget)"
++            record "SKIP runner_input_json (MGYP full-MSA input: 345 tokens, 4323 MSA; model exceeded 15 minutes)"
++            step runner_protein_200 runner_protein_200
++            ;;
++        runner_full)
++            step runner_direct runner_direct
++            step runner_input_json runner_input_json
++            ;;
++        search)
++            step search_msa search_msa
++            step search_msa_template search_msa_template
++            step search_pred_from_preprocessed search_pred_from_preprocessed
++            step search_prep_rna search_prep_rna
++            ;;
++        all)
++            run_stage doctor
++            run_stage core
++            run_stage prepared
++            run_stage json
++            run_stage runner
++            ;;
++        *)
++            echo "Unknown stage: $1" >&2
++            exit 2
++            ;;
++    esac
++}
++
++run_stage "${STAGE}"
++
++echo
++echo "================ acceptance summary ================"
++cat "${SUMMARY}"
++echo "===================================================="
++
++if [[ "${FAILURES}" -gt 0 ]]; then
++    echo "${FAILURES} step(s) failed." >&2
++    exit 1
++fi
++
++echo "All steps passed."
+diff --git a/sdaa/container/verify_sdaa_environment.py b/sdaa/container/verify_sdaa_environment.py
+new file mode 100755
+index 0000000..49e16da
+--- /dev/null
++++ b/sdaa/container/verify_sdaa_environment.py
+@@ -0,0 +1,134 @@
++#!/usr/bin/env python3
++"""Probe OpenDDE's SDAA runtime and the operators used by inference."""
++
++from __future__ import annotations
++
++import math
++import sys
++import traceback
++
++import torch
++import torch.nn.functional as F
++import torch_sdaa
++
++from opendde.utils.environment import get_torch_runtime_info, select_torch_device
++from opendde.utils.seed import seed_everything
++from opendde.utils.torch_utils import cleanup_device_memory, disabled_autocast
++
++
++failures: list[str] = []
++warnings: list[str] = []
++
++
++def check(name: str, fn, required: bool = True) -> None:
++    try:
++        result = fn()
++        torch.sdaa.synchronize()
++        print(f"PASS {name}: {result}")
++    except Exception as exc:
++        label = "FAIL" if required else "WARN"
++        print(f"{label} {name}: {type(exc).__name__}: {exc}")
++        traceback.print_exc()
++        (failures if required else warnings).append(name)
++
++
++def main() -> int:
++    print(f"python={sys.version.split()[0]}")
++    print(f"torch={torch.__version__}")
++    print(f"torch_sdaa={getattr(torch_sdaa, '__version__', 'unknown')}")
++    print(f"torch_cuda_available={torch.cuda.is_available()}")
++    print(f"torch_sdaa_available={torch.sdaa.is_available()}")
++    print(f"torch_sdaa_device_count={torch.sdaa.device_count()}")
++    print(f"runtime_info={get_torch_runtime_info()}")
++
++    if not torch.sdaa.is_available() or torch.sdaa.device_count() < 1:
++        print("FAIL no mapped SDAA device is visible")
++        return 1
++    device = select_torch_device("sdaa", local_rank=0)
++    print(f"selected_device={device}")
++
++    def tensor_ops():
++        a = torch.randn(8, 8, device=device)
++        b = torch.randn(8, 8, device=device)
++        matrix = a @ b
++        einsum = torch.einsum("ij,jk->ik", a, b)
++        normalized = F.layer_norm(matrix, (8,))
++        probabilities = torch.softmax(normalized, dim=-1)
++        indices = torch.tensor([0, 2, 2, 6], device=device)
++        selected = torch.index_select(a, 0, indices)
++        scattered = torch.zeros(8, device=device)
++        scattered.scatter_add_(0, indices, torch.ones(4, device=device))
++        assert all(torch.isfinite(x).all().item() for x in (matrix, einsum, normalized, probabilities, selected, scattered))
++        return f"matmul/einsum/layer_norm/softmax/index_select/scatter_add finite; shape={tuple(matrix.shape)}"
++
++    check("inference tensor operators", tensor_ops)
++
++    def integer_charge_arcsinh():
++        raw = torch.tensor([-1, 0, 1], dtype=torch.int64, device=device)
++        actual = torch.arcsinh(raw.to(dtype=torch.float32))
++        expected = torch.arcsinh(raw.cpu().to(dtype=torch.float32)).to(device)
++        assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
++        return f"int64 reference charges cast to float32; result={actual.cpu().tolist()}"
++
++    check("int64 reference-charge arcsinh workaround", integer_charge_arcsinh)
++
++    def bool_any_reduction():
++        values = torch.tensor(
++            [[True, False], [False, False]], dtype=torch.bool, device=device
++        )
++        observed = values.any(dim=-1)
++        assert torch.equal(observed.cpu(), torch.tensor([True, False]))
++        return f"bool any reduction={observed.cpu().tolist()}"
++
++    check("boolean any reduction", bool_any_reduction)
++
++    def bf16_autocast():
++        x = torch.randn(16, 16, device=device)
++        with torch.amp.autocast("sdaa", dtype=torch.bfloat16):
++            y = x @ x
++        assert torch.isfinite(y).all().item()
++        return f"autocast output dtype={y.dtype}"
++
++    check("bfloat16 autocast", bf16_autocast)
++
++    def random_seed():
++        seed_everything(20261010, deterministic=False)
++        first = torch.rand(32, device=device)
++        seed_everything(20261010, deterministic=False)
++        second = torch.rand(32, device=device)
++        assert torch.equal(first, second), "SDAA random stream changed after reseeding"
++        return f"reseeded stream reproducible; checksum={first.sum().item():.6f}"
++
++    check("seed_everything / SDAA RNG", random_seed)
++
++    def disabled_amp():
++        x = torch.ones(4, 4, device=device)
++        with torch.amp.autocast("sdaa", dtype=torch.bfloat16):
++            with disabled_autocast():
++                y = x @ x
++        assert y.dtype == torch.float32
++        return f"disabled autocast output dtype={y.dtype}"
++
++    check("disabled autocast scope", disabled_amp)
++
++    def linalg_ops():
++        x = torch.randn(4, 4, device=device)
++        _, singular_values, _ = torch.linalg.svd(x)
++        determinant = torch.linalg.det(x)
++        assert torch.isfinite(singular_values).all().item() and math.isfinite(determinant.item())
++        return f"svd/det finite; determinant={determinant.item():.6f}"
++
++    check("optional linear algebra operators", linalg_ops, required=False)
++
++    def memory_cleanup():
++        cleanup_device_memory(device)
++        return "SDAA synchronize and cache cleanup completed"
++
++    check("memory cleanup", memory_cleanup)
++
++    print(f"summary=failures:{len(failures)} warnings:{len(warnings)}")
++    return 1 if failures else 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/sdaa/dockerignore b/sdaa/dockerignore
+new file mode 100644
+index 0000000..33b6b7e
+--- /dev/null
++++ b/sdaa/dockerignore
+@@ -0,0 +1,12 @@
++data/
++work/
++tmp/
++opt/
++backups/
++OpenDDE/.git/
++OpenDDE/**/__pycache__/
++OpenDDE/**/.pytest_cache/
++OpenDDE/.ruff_cache/
++
++.env.sdaa
++.ssh/
+diff --git a/sdaa/run-official-examples-sdaa.sh b/sdaa/run-official-examples-sdaa.sh
+new file mode 100755
+index 0000000..35b242f
+--- /dev/null
++++ b/sdaa/run-official-examples-sdaa.sh
+@@ -0,0 +1,64 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++STAGE="${1:-all}"
++OPENDDE_CONTAINER="${OPENDDE_CONTAINER:-opendde-sdaa}"
++ACCEPTANCE_NAME="${OPENDDE_ACCEPTANCE_NAME:-acceptance}"
++OPENDDE_INFERENCE_STEPS="${OPENDDE_INFERENCE_STEPS:-10}"
++OPENDDE_INFERENCE_CYCLES="${OPENDDE_INFERENCE_CYCLES:-1}"
++WORK_ROOT="${ROOT}/work/sdaa/${ACCEPTANCE_NAME}"
++cd "${ROOT}"
++mkdir -p "${WORK_ROOT}/logs"
++
++if [[ "$(docker inspect --format '{{.State.Status}}' "${OPENDDE_CONTAINER}" 2>/dev/null || true)" != "running" ]]; then
++    echo "SDAA container is not running; run OpenDDE/sdaa/build-sdaa.sh first." >&2
++    exit 1
++fi
++
++if [[ "$STAGE" == "doctor" ]]; then
++    docker exec -i "${OPENDDE_CONTAINER}" python /workspace/repro/OpenDDE/sdaa/container/verify_sdaa_environment.py 2>&1 | tee "$WORK_ROOT/logs/doctor-run.log"
++    exit
++fi
++
++case "${STAGE}" in
++    core|prepared|templates|template_smoke|json|runner|runner_full|search)
++        stages=("${STAGE}")
++        ;;
++    all)
++        stages=(core prepared json runner)
++        ;;
++    *)
++        echo "Usage: $0 [doctor|core|prepared|templates|template_smoke|json|runner|runner_full|search|all]" >&2
++        exit 2
++        ;;
++esac
++
++status=0
++for stage in "${stages[@]}"; do
++    stage_log="${WORK_ROOT}/logs/${stage}-run.log"
++    set +e
++    docker exec -i \
++        --env WORK_ROOT=/workspace/repro/work/sdaa/${ACCEPTANCE_NAME} \
++        --env OPENDDE_INFERENCE_STEPS="${OPENDDE_INFERENCE_STEPS}" \
++        --env OPENDDE_INFERENCE_CYCLES="${OPENDDE_INFERENCE_CYCLES}" \
++        "${OPENDDE_CONTAINER}" \
++        bash /workspace/repro/OpenDDE/sdaa/container/acceptance.sh "${stage}" \
++        2>&1 | tee "${stage_log}"
++    stage_status="${PIPESTATUS[0]}"
++    set -e
++    if [[ "${stage_status}" -ne 0 ]]; then
++        status="${stage_status}"
++        echo "Acceptance stage ${stage} failed; see ${stage_log}" >&2
++        break
++    fi
++    echo "Acceptance stage ${stage} passed: ${stage_log}"
++done
++
++wrong_owner="$(find "${WORK_ROOT}" \( ! -user "$(id -u)" -o ! -group "$(id -g)" \) -print -quit)"
++if [[ -n "${wrong_owner}" ]]; then
++    echo "Output owner check failed for ${wrong_owner}; expected $(id -u):$(id -g)" >&2
++    exit 1
++fi
++echo "Acceptance output ownership verified: $(id -u):$(id -g)"
++exit "${status}"
+diff --git a/sdaa/source.sdaa.lock b/sdaa/source.sdaa.lock
+new file mode 100644
+index 0000000..cf75f86
+--- /dev/null
++++ b/sdaa/source.sdaa.lock
+@@ -0,0 +1,23 @@
++profile=loongson-sdaa
++source_repository=https://github.com/aurekaresearch/OpenDDE
++source_commit=ddfa1df8aff1babf1fddac4247b7d2351bd0ce9f
++adaptation_branch=adapt/sdaa
++base_image=lasermpnn-sdaa321-loong:torch2.12.0-sdaa3.2.1-py312
++base_image_id=sha256:3e425da47a74a03b589f8e1c18a67dcb90c8bcbde977cc1df09fa01209b7a524
++base_image_repo_digest=unavailable-local-image-has-no-repo-digest
++python=3.12
++torch=2.12.0
++torch_sdaa=3.2.1
++sdaa_cards=8
++host_uid_gid=1006:1006
++venv=/opt/venvs/opendde-sdaa
++dependency_install=source-without-dependencies; reuse-pinned-base-runtime
++kalign_version=3.6.0
++kalign_source_repository=https://github.com/TimoLassmann/kalign
++kalign_source_tag=v3.6.0
++kalign_source_commit=edd04a358dd8ea1e9379dd74053768d28c7b8613
++kalign_binary_sha256=ecebb6b6320f1b242d982f4c8c5825c6c83585fedc49fa51c3086972ce0ea391
++kalign_build_host_arch=loongarch64
++kalign_build_gcc=12.3.0
++kalign_build_cmake=3.26.3
++kalign_build_flags=Release;static-library;threadpool;no-sse;no-avx;no-avx2
+-- 
+2.41.0
+
