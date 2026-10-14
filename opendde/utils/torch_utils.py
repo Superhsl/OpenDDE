@@ -27,6 +27,9 @@ def disabled_autocast():
     """
     with ExitStack() as stack:
         stack.enter_context(torch.amp.autocast("cuda", enabled=False))
+        sdaa_backend = getattr(torch, "sdaa", None)
+        if sdaa_backend is not None and sdaa_backend.is_available():
+            stack.enter_context(torch.amp.autocast("sdaa", enabled=False))
         if _mps_autocast_available():
             stack.enter_context(torch.amp.autocast("mps", enabled=False))
         yield
@@ -109,6 +112,24 @@ def cleanup_device_memory(
             empty_cache=torch.cuda.empty_cache,
             suppress_errors=suppress_errors,
         )
+
+    if selected_device.type == "sdaa":
+        sdaa_backend = getattr(torch, "sdaa", None)
+        if sdaa_backend is not None and sdaa_backend.is_available():
+            device_index = (
+                selected_device.index
+                if selected_device.index is not None
+                else sdaa_backend.current_device()
+            )
+            _clear_accelerator_cache(
+                synchronize=(
+                    partial(sdaa_backend.synchronize, device_index)
+                    if synchronize
+                    else None
+                ),
+                empty_cache=sdaa_backend.empty_cache,
+                suppress_errors=suppress_errors,
+            )
 
 
 @contextmanager

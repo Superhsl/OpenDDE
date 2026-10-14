@@ -1,0 +1,12 @@
+data/
+work/
+tmp/
+opt/
+backups/
+OpenDDE/.git/
+OpenDDE/**/__pycache__/
+OpenDDE/**/.pytest_cache/
+OpenDDE/.ruff_cache/
+
+.env.sdaa
+.ssh/

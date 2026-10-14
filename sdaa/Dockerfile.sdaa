@@ -1,0 +1,54 @@
+ARG BASE_IMAGE=lasermpnn-sdaa321-loong:torch2.12.0-sdaa3.2.1-py312
+FROM ${BASE_IMAGE}
+USER root
+
+ARG HOST_UID=1006
+ARG HOST_GID=1006
+ARG BASE_IMAGE_ID=sha256:3e425da47a74a03b589f8e1c18a67dcb90c8bcbde977cc1df09fa01209b7a524
+ARG OPENDDE_COMMIT=ddfa1df8aff1babf1fddac4247b7d2351bd0ce9f
+ARG KALIGN_COMMIT=edd04a358dd8ea1e9379dd74053768d28c7b8613
+
+LABEL org.opencontainers.image.title="OpenDDE Loongson SDAA runtime" \
+      org.opencontainers.image.revision="${OPENDDE_COMMIT}" \
+      org.opendde.repro.base-image="${BASE_IMAGE}" \
+      org.opendde.repro.base-image-id="${BASE_IMAGE_ID}" \
+      org.opendde.repro.profile="loongson-sdaa" \
+      org.opendde.kalign.version="3.6.0" \
+      org.opendde.kalign.source-commit="${KALIGN_COMMIT}"
+
+ENV VIRTUAL_ENV=/opt/venvs/opendde-sdaa \
+    PATH=/opt/venvs/opendde-sdaa/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    OPENDDE_ROOT_DIR=/opendde_data \
+    LAYERNORM_TYPE=torch
+
+RUN /opt/venvs/lasermpnn-sdaa321-py312/bin/python -m venv --system-site-packages "${VIRTUAL_ENV}" \
+    && test -f /opt/venvs/lasermpnn-sdaa321-py312/lib/python3.12/site-packages/sdaa321-base-runtime.pth \
+    && install -m 0644 \
+        /opt/venvs/lasermpnn-sdaa321-py312/lib/python3.12/site-packages/sdaa321-base-runtime.pth \
+        "${VIRTUAL_ENV}/lib/python3.12/site-packages/sdaa321-base-runtime.pth" \
+    && mkdir -p /opt/opendde-source /workspace/repro /opendde_data /home/opendde
+
+COPY OpenDDE/ /opt/opendde-source/
+COPY vendor/kalign-3.6.0/bin/kalign /usr/local/bin/kalign
+COPY vendor/kalign-3.6.0/LICENSE /usr/share/licenses/kalign/LICENSE
+RUN chmod 0755 /usr/local/bin/kalign \
+    && test "$(/usr/local/bin/kalign --version)" = "kalign 3.6.0"
+
+RUN "${VIRTUAL_ENV}/bin/python" -m pip install \
+        --no-deps --no-build-isolation --no-cache-dir /opt/opendde-source \
+    && "${VIRTUAL_ENV}/bin/python" -c \
+        "import torch, torch_sdaa, opendde; assert torch.__version__.startswith('2.12.'), torch.__version__; print('torch', torch.__version__, 'torch_sdaa', torch_sdaa.__version__)" \
+    && "${VIRTUAL_ENV}/bin/opendde" --help >/dev/null \
+    && test "$("${VIRTUAL_ENV}/bin/python" -c 'import sys; print(sys.prefix)')" = "${VIRTUAL_ENV}"
+
+RUN chown -R "${HOST_UID}:${HOST_GID}" /workspace/repro /opendde_data /home/opendde
+
+ENV HOME=/home/opendde
+USER ${HOST_UID}:${HOST_GID}
+WORKDIR /workspace/repro/OpenDDE
+
+CMD ["sleep", "infinity"]

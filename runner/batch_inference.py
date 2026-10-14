@@ -401,7 +401,7 @@ def get_default_runner(
         n_step (int): Number of diffusion steps.
         n_sample (int): Number of samples.
         dtype (str): Inference data type. Defaults to 'fp32'.
-        device (str): Device selection: auto, cpu, cuda, or mps.
+        device (str): Device selection: auto, cpu, cuda, sdaa, or mps.
         model_name (str): Name of the model checkpoint.
         load_checkpoint_path (str): Explicit checkpoint path. If unset, uses the released checkpoint filename for model_name.
         use_msa (bool): Whether to use MSA.
@@ -574,7 +574,7 @@ def inference_jsons(
         n_step (int): Number of diffusion steps.
         n_sample (int): Number of samples.
         dtype (str): Data type.
-        device (str): Device selection: auto, cpu, cuda, or mps.
+        device (str): Device selection: auto, cpu, cuda, sdaa, or mps.
         model_name (str): Model name.
         load_checkpoint_path (str): Explicit checkpoint path.
         trimul_kernel (str): Kernel for triangle multiplicative.
@@ -964,7 +964,7 @@ def predict(
         step (int): Number of diffusion steps.
         sample (int): Number of samples.
         dtype (str): Data type.
-        device (str): Device selection: auto, cpu, cuda, or mps.
+        device (str): Device selection: auto, cpu, cuda, sdaa, or mps.
         model_name (str): Model name.
         load_checkpoint_path (str): Explicit checkpoint path.
         use_msa (bool): Use MSA.

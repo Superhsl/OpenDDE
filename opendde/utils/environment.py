@@ -75,6 +75,10 @@ class TorchRuntimeInfo:
     device_name: Optional[str] = None
     import_error: Optional[str] = None
     cuda_probe_error: Optional[str] = None
+    sdaa_available: bool = False
+    sdaa_device_count: int = 0
+    sdaa_device_name: Optional[str] = None
+    sdaa_probe_error: Optional[str] = None
     mps_built: bool = False
     mps_available: bool = False
 
@@ -154,6 +158,25 @@ def _probe_mps(torch_module) -> tuple[bool, bool]:
     return built, available
 
 
+def _probe_sdaa(torch_module) -> tuple[bool, int, Optional[str], Optional[str]]:
+    """Import the SDAA registration package and probe visible devices."""
+    try:
+        importlib.import_module("torch_sdaa")
+    except Exception as exc:
+        return False, 0, None, _format_exception(exc)
+
+    backend = getattr(torch_module, "sdaa", None)
+    if backend is None:
+        return False, 0, None, "torch.sdaa is not registered"
+    try:
+        available = bool(backend.is_available())
+        count = int(backend.device_count()) if available else 0
+        name = backend.get_device_name(0) if count else None
+    except Exception as exc:
+        return False, 0, None, _format_exception(exc)
+    return available, count, name, None
+
+
 def get_torch_runtime_info() -> TorchRuntimeInfo:
     if not module_available("torch"):
         return TorchRuntimeInfo(installed=False)
@@ -176,6 +199,7 @@ def get_torch_runtime_info() -> TorchRuntimeInfo:
     device_name = None
     cuda_version = getattr(getattr(torch_module, "version", None), "cuda", None)
     mps_built, mps_available = _probe_mps(torch_module)
+    sdaa_available, sdaa_count, sdaa_name, sdaa_error = _probe_sdaa(torch_module)
     try:
         cuda_available = bool(torch_module.cuda.is_available())
         device_count = int(torch_module.cuda.device_count()) if cuda_available else 0
@@ -189,6 +213,10 @@ def get_torch_runtime_info() -> TorchRuntimeInfo:
             device_count=device_count,
             device_name=device_name,
             cuda_probe_error=_format_exception(exc),
+            sdaa_available=sdaa_available,
+            sdaa_device_count=sdaa_count,
+            sdaa_device_name=sdaa_name,
+            sdaa_probe_error=sdaa_error,
             mps_built=mps_built,
             mps_available=mps_available,
         )
@@ -200,6 +228,10 @@ def get_torch_runtime_info() -> TorchRuntimeInfo:
         cuda_version=cuda_version,
         device_count=device_count,
         device_name=device_name,
+        sdaa_available=sdaa_available,
+        sdaa_device_count=sdaa_count,
+        sdaa_device_name=sdaa_name,
+        sdaa_probe_error=sdaa_error,
         mps_built=mps_built,
         mps_available=mps_available,
     )
@@ -208,7 +240,7 @@ def get_torch_runtime_info() -> TorchRuntimeInfo:
 def select_torch_device(
     requested_device: InferenceDevice = "auto", local_rank: int = 0
 ) -> torch.device:
-    """Resolve an inference device, preferring CUDA, then Apple MPS, then CPU."""
+    """Resolve a device, preferring CUDA, SDAA, Apple MPS, then CPU."""
     if requested_device not in INFERENCE_DEVICE_CHOICES:
         choices = ", ".join(INFERENCE_DEVICE_CHOICES)
         raise ValueError(
@@ -222,15 +254,35 @@ def select_torch_device(
             f"PyTorch is required for inference but could not be imported: {_format_exception(exc)}"
         ) from exc
 
-    cuda_available = torch.cuda.is_available()
+    cuda_available = bool(torch.cuda.is_available())
     _, mps_available = _probe_mps(torch)
+
     if requested_device == "auto":
         if cuda_available:
             requested_device = "cuda"
-        elif mps_available:
-            requested_device = "mps"
         else:
-            requested_device = "cpu"
+            sdaa_available, _, _, _ = _probe_sdaa(torch)
+            if sdaa_available:
+                requested_device = "sdaa"
+            elif mps_available:
+                requested_device = "mps"
+            else:
+                requested_device = "cpu"
+
+    if requested_device == "sdaa":
+        sdaa_available, sdaa_count, _, sdaa_error = _probe_sdaa(torch)
+        if not sdaa_available:
+            detail = f" ({sdaa_error})" if sdaa_error else ""
+            raise RuntimeError(
+                "SDAA was requested, but torch_sdaa reports no available device"
+                f"{detail}."
+            )
+        if local_rank < 0 or local_rank >= sdaa_count:
+            raise RuntimeError(
+                f"SDAA device index {local_rank} is unavailable; detected "
+                f"{sdaa_count} SDAA device(s)."
+            )
+        return torch.device(f"sdaa:{local_rank}")
 
     if requested_device == "mps":
         if not mps_available:
@@ -374,6 +426,11 @@ def _runtime_recommendation(
             "PyTorch is installed but unusable. Reinstall a build compatible with "
             f"this Python/platform ({torch_info.import_error})."
         )
+    if selected_device is not None and selected_device.type == "sdaa":
+        return (
+            "PyTorch SDAA inference is available. OpenDDE will use torch "
+            "triangle kernels; cuEquivariance is CUDA-only."
+        )
     if torch_info.cuda_probe_error:
         return (
             "PyTorch imports successfully, but CUDA probing failed "
@@ -425,7 +482,7 @@ def format_doctor_report() -> str:
     device_error: Optional[str] = None
     cueq_status: Optional[CuEquivarianceRuntimeStatus] = None
     if torch_info.usable:
-        if torch_info.cuda_probe_error:
+        if torch_info.cuda_probe_error and not torch_info.sdaa_available:
             device_error = torch_info.cuda_probe_error
         else:
             try:
@@ -452,6 +509,10 @@ def format_doctor_report() -> str:
         f"- CUDA device count: {torch_info.device_count}",
         f"- CUDA device 0: {torch_info.device_name or 'none'}",
         f"- CUDA probe error: {torch_info.cuda_probe_error or 'none'}",
+        f"- torch.sdaa.is_available: {torch_info.sdaa_available}",
+        f"- SDAA device count: {torch_info.sdaa_device_count}",
+        f"- SDAA device 0: {torch_info.sdaa_device_name or 'none'}",
+        f"- SDAA probe error: {torch_info.sdaa_probe_error or 'none'}",
         f"- torch.backends.mps.is_built: {torch_info.mps_built}",
         f"- torch.backends.mps.is_available: {torch_info.mps_available}",
         f"- nvidia-smi: {nvidia_smi_info or ('found' if nvidia_smi_found else 'not found')}",

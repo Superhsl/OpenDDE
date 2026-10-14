@@ -3094,8 +3094,15 @@ class AtomAttentionEncoder(nn.Module):
         def _prepare_local_atom_window_state():
             batch_shape = ref_pos.shape[:-2]
             n_atom = ref_pos.shape[-2]
+            # Cast integer charges to the projection dtype before arcsinh for SDAA compatibility.
+            ref_charge_fp = ref_charge.to(
+                dtype=self.linear_no_bias_ref_charge.weight.dtype
+            )
+            charge_feature = torch.arcsinh(ref_charge_fp).reshape(
+                *batch_shape, n_atom, 1
+            )
             c_l = self.linear_no_bias_ref_pos(ref_pos) + self.linear_no_bias_ref_charge(
-                torch.arcsinh(ref_charge).reshape(*batch_shape, n_atom, 1)
+                charge_feature
             )
             ref_features = torch.cat(
                 [
@@ -3317,9 +3324,15 @@ class AtomAttentionEncoder(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_shape = ref_pos.shape[:-2]
         N_atom = ref_pos.shape[-2]
+        # Cast integer charges to the projection dtype before arcsinh for SDAA compatibility.
+        ref_charge_fp = ref_charge.to(
+            dtype=self.linear_no_bias_ref_charge.weight.dtype
+        )
+        charge_feature = torch.arcsinh(ref_charge_fp).reshape(
+            *batch_shape, N_atom, 1
+        )
         c_l = self.linear_no_bias_ref_pos(ref_pos) + self.linear_no_bias_ref_charge(
-            # use arcsinh for ref_charge
-            torch.arcsinh(ref_charge).reshape(*batch_shape, N_atom, 1)
+            charge_feature
         )
         if inplace_safe:
             c_l += self.linear_no_bias_f(

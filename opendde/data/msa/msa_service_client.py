@@ -107,7 +107,14 @@ def run_mmseqs2(
         for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
             try:
                 response = requests.request(
-                    method, url, timeout=6.02, headers=headers, **kwargs
+                    method,
+                    url,
+                    timeout=(
+                        6.02,
+                        float(os.getenv("OPENDDE_MSA_READ_TIMEOUT", "6.02")),
+                    ),
+                    headers=headers,
+                    **kwargs,
                 )
                 response.raise_for_status()
                 return response

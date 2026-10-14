@@ -68,6 +68,9 @@ logger = get_logger(__name__)
 def _tf32_runtime_scope(enabled: bool):
     """Apply one model's TF32 policy without leaking it to the host process."""
 
+    if not torch.cuda.is_available():
+        yield
+        return
     previous_matmul = torch.backends.cuda.matmul.allow_tf32
     previous_cudnn = torch.backends.cudnn.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
@@ -1595,7 +1598,8 @@ class OpenDDE(nn.Module):
         pair_input_feature_dict: dict[str, Any],
         N_cycle: int,
     ) -> dict[str, Any]:
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         self.add_shape_complementarity_predictions(
             pred_dict=pred_dict,
@@ -2083,11 +2087,12 @@ class OpenDDE(nn.Module):
         # Minimal embedded/test model objects may intentionally omit the
         # inference-only policy field. In that case preserve the host's active
         # matmul policy rather than inventing a new one.
-        enable_tf32 = getattr(
-            self.configs,
-            "enable_tf32",
-            torch.backends.cuda.matmul.allow_tf32,
+        default_tf32 = (
+            torch.backends.cuda.matmul.allow_tf32
+            if torch.cuda.is_available()
+            else False
         )
+        enable_tf32 = getattr(self.configs, "enable_tf32", default_tf32)
         with _tf32_runtime_scope(enable_tf32):
             return self._forward_impl(
                 input_feature_dict=input_feature_dict,

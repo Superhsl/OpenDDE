@@ -1098,12 +1098,18 @@ class InferenceRunner(object):
                 f"LOCAL_RANK: {DIST_WRAPPER.local_rank} - CUDA_VISIBLE_DEVICES: [{devices}]"
             )
             torch.cuda.set_device(self.device)
+        elif self.device.type == "sdaa":
+            torch.sdaa.set_device(self.device)
+            devices = os.getenv("SDAA_VISIBLE_DEVICES", "all")
+            logging.info(
+                f"LOCAL_RANK: {DIST_WRAPPER.local_rank} - SDAA_VISIBLE_DEVICES: [{devices}]"
+            )
 
         if world_size > 1:
             if not self.use_cuda:
                 raise RuntimeError(
-                    "Distributed Fold-CP inference requires NVIDIA CUDA; CPU "
-                    "and Apple MPS support single-process inference only."
+                    "Distributed Fold-CP inference currently requires NVIDIA "
+                    "CUDA/NCCL; SDAA, CPU, and Apple MPS support single-process inference."
                 )
             if not dist.is_nccl_available():
                 raise RuntimeError(
@@ -1388,7 +1394,7 @@ class InferenceRunner(object):
             "bf16": torch.bfloat16,
         }[self.configs.dtype]
 
-        if eval_precision == torch.float32 or self.device.type not in {"cuda", "mps"}:
+        if eval_precision == torch.float32 or self.device.type not in {"cuda", "mps", "sdaa"}:
             enable_amp = nullcontext()
         else:
             enable_amp = torch.autocast(

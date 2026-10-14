@@ -449,7 +449,7 @@ def calculate_clash(
         dummy_is_dna,
         dummy_is_rna,
     )
-    return clash_dict["summary"]["af3_clash"].reshape(N_sample, -1).max(dim=-1)[0]
+    return clash_dict["summary"]["af3_clash"].reshape(N_sample, -1).any(dim=-1)
 
 
 def calculate_ptm(
