@@ -418,7 +418,7 @@ search_prep_rna() {
 run_stage() {
     case "$1" in
         doctor)
-            step sdaa_runtime python /workspace/repro/OpenDDE/sdaa/container/verify_sdaa_environment.py
+            step sdaa_runtime python /workspace/repro/OpenDDE/sdaa/scripts/container/verify_sdaa_environment.py
             ;;
         core)
             step core_protein_200_fp32 core_protein_200_fp32

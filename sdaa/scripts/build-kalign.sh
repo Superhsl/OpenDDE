@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$BASH_SOURCE")/../.." && pwd)"
-LOCK="$ROOT/OpenDDE/sdaa/source.sdaa.lock"
+ROOT="$(cd "$(dirname "$BASH_SOURCE")/../../.." && pwd)"
+LOCK="$ROOT/OpenDDE/sdaa/build/source.sdaa.lock"
 get_pin() {
     sed -n "s/^$1=//p" "$LOCK"
 }

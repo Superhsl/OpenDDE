@@ -12,7 +12,7 @@
 | 环境 | 架构与系统 | 镜像 digest/ID | Python/框架及设备插件 | GPU/实际后端 | 环境锁 |
 | --- | --- | --- | --- | --- | --- |
 | CUDA 基线 | Intel Xeon Platinum 8468，x86_64，Linux 5.15 | 基础镜像 digest：sha256:2b59b1b91885677814f78be1f8df48a25d5dc952eb6580eaecfefca510f9afd3；实测容器 image ID 相同 | Python 3.11.16，PyTorch 2.7.1+cu126，CUDA 12.6 | NVIDIA H100 80 GB，cuda:0 | 复现工程外层 source.lock、locks/、checksums.sha256 |
-| 龙芯适配 | Loongson-3C6000/D，loongarch64，Loongnix Server 23.1 | 本地基础镜像 ID：sha256:3e425da47a74a03b589f8e1c18a67dcb90c8bcbde977cc1df09fa01209b7a524；无 RepoDigest | Python 3.12.13，PyTorch 2.12.0，torch_sdaa 3.2.1 | 8 卡已映射；实测单进程 sdaa:0 | sdaa/source.sdaa.lock、sdaa/.env.sdaa.example |
+| 龙芯适配 | Loongson-3C6000/D，loongarch64，Loongnix Server 23.1 | 本地基础镜像 ID：sha256:3e425da47a74a03b589f8e1c18a67dcb90c8bcbde977cc1df09fa01209b7a524；无 RepoDigest | Python 3.12.13，PyTorch 2.12.0，torch_sdaa 3.2.1 | 8 卡已映射；实测单进程 sdaa:0 | sdaa/build/source.sdaa.lock、sdaa/build/.env.sdaa.example |
 
 权重、搜索数据库和输出均不随源码仓库提交。
 
@@ -33,7 +33,7 @@
 
 | 包及版本 | 为什么需要适配 | 来源/许可证 | 构建命令或 wheel 标签 | SHA-256 |
 | --- | --- | --- | --- | ---  |
-| Kalign 3.6.0（命令行程序，非 wheel） | 龙芯上需要原生 loongarch64 可执行文件 | 上游 TimoLassmann/kalign；许可证文本随构建产物保存 | sdaa/build-kalign-sdaa.sh；产物不提交仓库 | ecebb6b6320f1b242d982f4c8c5825c6c83585fedc49fa51c3086972ce0ea391 |
+| Kalign 3.6.0（命令行程序，非 wheel） | 龙芯上需要原生 loongarch64 可执行文件 | 上游 TimoLassmann/kalign；许可证文本随构建产物保存 | sdaa/scripts/build-kalign.sh；产物不提交仓库 | ecebb6b6320f1b242d982f4c8c5825c6c83585fedc49fa51c3086972ce0ea391 |
 
 HMMER 是完整模板搜索的外部程序，当前使用 x86_64 程序加 QEMU；现成 MSA 的 7r6r 推理不依赖它，也不能把它写成已完成的龙芯原生 wheel。
 
