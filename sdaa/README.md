@@ -19,4 +19,4 @@ OpenDDE/sdaa/run.sh core     # 官方轻量推理验收
 OpenDDE/sdaa/run.sh search   # 搜索流程验收，需另备搜索数据/服务
 ```
 
-目录说明：`build/` 存放 Dockerfile、环境模板和版本锁；`scripts/` 存放内部构建与验收脚本；`docs/` 存放[完整复现步骤](docs/LOONG_SDAA_REPRO.md)与[迁移和 CUDA/SDAA 对比](docs/SDAA_ADAPTATION.md)；`patches/` 是历史适配补丁归档。模型权重、数据库、容器和输出不在仓库中。
+目录说明：`build/` 存放 Dockerfile、环境模板和版本锁；`scripts/` 存放内部构建与验收脚本；顶层 [LOONG_SDAA_REPRO.md](LOONG_SDAA_REPRO.md) 记录完整复现步骤，[SDAA_ADAPTATION.md](SDAA_ADAPTATION.md) 记录迁移和 CUDA/SDAA 对比；`patches/` 是历史适配补丁归档。模型权重、数据库、容器和输出不在仓库中。
