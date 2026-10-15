@@ -1,0 +1,658 @@
+From afd6f4ddc76ebc04b8031c8d7cc984668343fd65 Mon Sep 17 00:00:00 2001
+From: Superhsl <2949565071@qq.com>
+Date: Thu, 15 Oct 2026 11:01:54 +0800
+Subject: [PATCH 2/2] [sdaa-adapt] Simplify SDAA build and inference entry
+ points
+
+Keep README, build.sh and run.sh at the top level. Move build assets, internal scripts and detailed documentation into subdirectories; make the official 7r6r example the default and preserve output directories across runs.
+---
+ sdaa/LOONG_SDAA_REPRO.md                      | 121 ------------------
+ sdaa/README.md                                |  44 +++----
+ sdaa/{build-sdaa.sh => build.sh}              |  67 +++++++---
+ sdaa/{ => build}/.env.sdaa.example            |   0
+ sdaa/{ => build}/Dockerfile.sdaa              |   0
+ sdaa/{ => build}/dockerignore                 |   0
+ sdaa/{ => build}/source.sdaa.lock             |   0
+ sdaa/docs/LOONG_SDAA_REPRO.md                 |  64 +++++++++
+ sdaa/{ => docs}/SDAA_ADAPTATION.md            |   4 +-
+ sdaa/run-official-examples-sdaa.sh            |  64 ---------
+ sdaa/run.sh                                   | 109 ++++++++++++++++
+ .../build-kalign.sh}                          |   4 +-
+ sdaa/{ => scripts}/container/acceptance.sh    |   2 +-
+ .../container/verify_sdaa_environment.py      |   0
+ 14 files changed, 243 insertions(+), 236 deletions(-)
+ delete mode 100644 sdaa/LOONG_SDAA_REPRO.md
+ rename sdaa/{build-sdaa.sh => build.sh} (58%)
+ rename sdaa/{ => build}/.env.sdaa.example (100%)
+ rename sdaa/{ => build}/Dockerfile.sdaa (100%)
+ rename sdaa/{ => build}/dockerignore (100%)
+ rename sdaa/{ => build}/source.sdaa.lock (100%)
+ create mode 100644 sdaa/docs/LOONG_SDAA_REPRO.md
+ rename sdaa/{ => docs}/SDAA_ADAPTATION.md (97%)
+ delete mode 100755 sdaa/run-official-examples-sdaa.sh
+ create mode 100755 sdaa/run.sh
+ rename sdaa/{build-kalign-sdaa.sh => scripts/build-kalign.sh} (95%)
+ rename sdaa/{ => scripts}/container/acceptance.sh (99%)
+ rename sdaa/{ => scripts}/container/verify_sdaa_environment.py (100%)
+
+diff --git a/sdaa/LOONG_SDAA_REPRO.md b/sdaa/LOONG_SDAA_REPRO.md
+deleted file mode 100644
+index 73a0f58..0000000
+--- a/sdaa/LOONG_SDAA_REPRO.md
++++ /dev/null
+@@ -1,121 +0,0 @@
+-# OpenDDE 龙芯 SDAA 复现教程
+-
+-本教程适用于**包含 SDAA 源码修改和本目录文件的适配仓库提交**。目标是从干净检出运行官方 7r6r 示例：使用仓库自带 MSA、通用权重 opendde.pt、BF16、seed 101、10 个扩散步和 1 个循环，在单进程的 sdaa:0 上生成结构。完整适配问题与 CUDA 对比见 [SDAA_ADAPTATION.md](SDAA_ADAPTATION.md)。
+-
+-## 1. 准备仓库与目标主机
+-
+-需要 loongarch64 主机、Docker 权限、/dev/tcaicard0 至 /dev/tcaicard7、Git、Python 3、GCC 12.3.0 和 CMake 3.26.3。构建脚本会映射 8 张卡，推理示例只使用 sdaa:0。基础镜像须事先在本机提供；当前锁定的本地镜像 tag 为 lasermpnn-sdaa321-loong:torch2.12.0-sdaa3.2.1-py312，image ID 见 [source.sdaa.lock](source.sdaa.lock)。该镜像没有可用的远端 RepoDigest，不能仅凭 tag 判断镜像相同。
+-
+-发布仓库后，先在 shell 中设置 REPO_URL 为**含 SDAA 修改的仓库地址**，ADAPT_COMMIT 为该仓库的**完整适配提交 SHA**。锁文件中的 source_commit 是上游基线提交，不能替代 ADAPT_COMMIT。从准备存放复现工程的目录执行：
+-
+-~~~bash
+-set -euo pipefail
+-test -n "$REPO_URL"
+-test -n "$ADAPT_COMMIT"
+-mkdir opendde-sdaa-repro
+-cd opendde-sdaa-repro
+-git clone "$REPO_URL" OpenDDE
+-git -C OpenDDE checkout --detach "$ADAPT_COMMIT"
+-test "$(uname -m)" = loongarch64
+-git -C OpenDDE rev-parse HEAD
+-git -C OpenDDE status --short
+-
+-BASE_IMAGE=$(sed -n 's/^base_image=//p' OpenDDE/sdaa/source.sdaa.lock)
+-EXPECTED_IMAGE_ID=$(sed -n 's/^base_image_id=//p' OpenDDE/sdaa/source.sdaa.lock)
+-test "$(docker image inspect "$BASE_IMAGE" --format '{{.Id}}')" = "$EXPECTED_IMAGE_ID"
+-for card in 0 1 2 3 4 5 6 7; do test -e "/dev/tcaicard$card"; done
+-/opt/tecoai/bin/teco-smi
+-~~~
+-
+-如果镜像 ID、设备或编译器版本不符，先准备与锁文件一致的环境；不要只改锁值来跳过校验。
+-
+-## 2. 准备运行数据与构建配置
+-
+-外层复现工程采用如下布局；data/、work/、tmp/ 和 vendor/ 不属于源码仓库，也不应提交：
+-
+-~~~text
+-opendde-sdaa-repro/
+-├── OpenDDE/             # 含 sdaa/ 的适配仓库
+-├── data/
+-│   ├── checkpoint/opendde.pt
+-│   └── common/
+-├── vendor/kalign-3.6.0/
+-├── work/
+-├── tmp/
+-├── .dockerignore
+-└── .env.sdaa
+-~~~
+-
+-在外层目录继续执行。环境示例中的 UID/GID 要改为当前宿主机用户；基础镜像 ID 保持与锁文件一致。
+-
+-~~~bash
+-mkdir -p data work tmp vendor
+-cp OpenDDE/sdaa/dockerignore .dockerignore
+-cp OpenDDE/sdaa/.env.sdaa.example .env.sdaa
+-sed -i "s/^HOST_UID=.*/HOST_UID=$(id -u)/" .env.sdaa
+-sed -i "s/^HOST_GID=.*/HOST_GID=$(id -g)/" .env.sdaa
+-~~~
+-
+-官方数据脚本从发布源获取通用权重和 common/ 文件。该示例使用**现成 MSA**，不需要大型 search_database/。如果服务器不能访问下载源，可从已准备好的同一发布版复制这些资产到相同目录，跳过下面的下载命令，再执行其余校验。
+-
+-~~~bash
+-OPENDDE_ROOT_DIR="$PWD/data" bash OpenDDE/scripts/download_opendde_data.sh --skip-search-database
+-printf '%s  %s\n' \
+-  7b826620390afad877ee2babc6a4d0df81b94d3a0be030959853d6a7da0807cc \
+-  data/checkpoint/opendde.pt | sha256sum -c -
+-for f in components.cif components.cif.rdkit_mol.pkl release_date_cache.json obsolete_to_successor.json; do
+-  test -s "data/common/$f"
+-done
+-test -s OpenDDE/examples/7r6r/msa/1/pairing.a3m
+-test -s OpenDDE/examples/7r6r/msa/1/non_pairing.a3m
+-~~~
+-
+-权重 SHA-256 来自仓库的 opendde/config/model_manifest.json。此最小示例不需要 opendde_abag.pt、搜索数据库或在线 MSA 服务。
+-
+-## 3. 构建 Kalign、镜像和独立容器
+-
+-Kalign 是构建脚本要求的龙芯原生程序；[build-kalign-sdaa.sh](build-kalign-sdaa.sh) 按锁定源码和编译器构建，并校验二进制 SHA-256。[build-sdaa.sh](build-sdaa.sh) 再核对基础镜像、UID/GID 和 Kalign，构建镜像 opendde-sdaa:torch2.12-sdaa3.2.1，并启动名为 opendde-sdaa 的容器。容器使用独立 venv /opt/venvs/opendde-sdaa，OpenDDE/ 与 data/ 只读挂载，work/ 与 tmp/ 可写挂载。
+-
+-~~~bash
+-OpenDDE/sdaa/build-kalign-sdaa.sh
+-OpenDDE/sdaa/build-sdaa.sh
+-OpenDDE/sdaa/run-official-examples-sdaa.sh doctor
+-~~~
+-
+-doctor 的日志保存在 work/sdaa/acceptance/logs/doctor-run.log；应看到 selected_device=sdaa:0、必要算子和 BF16 检查通过。若同名容器已存在，构建脚本会停止；先核对已有容器，勿覆盖其输出。
+-
+-## 4. 运行官方 7r6r 现成 MSA 示例
+-
+-官方 examples/example.json 有三个任务；下面只提取 7r6r。**必须在容器内的 /workspace/repro/OpenDDE 目录运行**，因为示例 JSON 的现成 MSA 路径是相对路径 ./examples/7r6r/msa/1。输入 JSON 使用容器内绝对路径，防止误触发在线搜索。每次换一个新的 RUN_DIR，避免覆盖历史结果。
+-
+-~~~bash
+-export RUN_DIR=work/sdaa/tutorial_7r6r_seed101
+-test ! -e "$RUN_DIR"
+-mkdir -p "$RUN_DIR"
+-python3 - <<'PY'
+-import json
+-import os
+-from pathlib import Path
+-jobs = json.loads(Path("OpenDDE/examples/example.json").read_text())
+-chosen = [job for job in jobs if job["name"] == "7r6r"]
+-assert len(chosen) == 1
+-(Path(os.environ["RUN_DIR"]) / "input_7r6r.json").write_text(
+-    json.dumps(chosen, indent=2) + "\n"
+-)
+-PY
+-
+-docker exec -e RUN_DIR="$RUN_DIR" opendde-sdaa /bin/bash -lc '
+-  cd /workspace/repro/OpenDDE &&
+-  test -s examples/7r6r/msa/1/pairing.a3m &&
+-  test -s examples/7r6r/msa/1/non_pairing.a3m &&
+-  opendde pred \
+-    -i "/workspace/repro/$RUN_DIR/input_7r6r.json" \
+-    -o "/workspace/repro/$RUN_DIR/result" \
+-    -s 101 -n opendde_v1 --device sdaa \
+-    --use_msa true --use_template false --use_rna_msa false \
+-    --trimul_kernel torch --triatt_kernel torch --enable_tf32 false \
+-    --sample 1 --step 10 --cycle 1 --dtype bf16
+-' > "$RUN_DIR/run.log" 2>&1
+-~~~
+-
+-这是已跑通的单卡、有界推理参数；10 步和 1 循环用于复现验证，不等于上游完整默认推理量。
+diff --git a/sdaa/README.md b/sdaa/README.md
+index 5a2b81b..8132cfc 100644
+--- a/sdaa/README.md
++++ b/sdaa/README.md
+@@ -1,36 +1,22 @@
+-# OpenDDE 龙芯 SDAA 适配
++# OpenDDE 龙芯 SDAA 运行入口
+ 
+-本目录保存可随 OpenDDE 源码仓库提交的 SDAA 部署与验收文件。模型兼容修改仍在仓库原有的 opendde/、runner/ 等文件中。本目录没有模型权重、数据库、虚拟环境、搜索结果、私钥或编译好的 Kalign。
++将本仓库放在复现工程的 `OpenDDE/` 目录下；与它同级放置 `data/`、`work/`、`tmp/` 和 `vendor/`。运行脚本会自动创建缺失的可写目录。需要龙芯 loongarch64 主机、Docker、8 张可映射的 SDAA 卡，以及已加载的固定基础镜像。官方 7r6r 示例需要 `data/checkpoint/opendde.pt`、`data/common/` 和仓库自带的 `examples/7r6r/msa/`，无需大型搜索数据库。
+ 
+-## 文件
++在复现工程根目录执行：
+ 
+-- dockerignore：外层 Docker 构建上下文的忽略规则，避免将数据库、输出和私密配置发送进构建过程。
+-- Dockerfile.sdaa：基于已固定的龙芯 Torch/SDAA 本地镜像创建独立 Python 3.12 venv，并安装当前 OpenDDE 源码。
+-- .env.sdaa.example、source.sdaa.lock：镜像 ID、宿主机 UID/GID、上游源码与 Kalign 版本和 SHA256 的记录。
+-- build-kalign-sdaa.sh：从锁定的 Kalign v3.6.0 源码构建龙芯可执行文件，核对哈希后放到外层 vendor/。
+-- build-sdaa.sh：核对基础镜像 ID、UID/GID 和 Kalign 哈希，再构建镜像并映射 8 张 SDAA 卡。
+-- container/verify_sdaa_environment.py：由 doctor 阶段调用，检查设备选择、必要算子、BF16、随机数和内存清理。
+-- run-official-examples-sdaa.sh、container/acceptance.sh：按阶段运行官方示例与迁移验收；输出写入外层 work/。
+-- SDAA_ADAPTATION.md：适配问题、第三方依赖处理、CUDA/SDAA 对比与复跑命令。
++```bash
++OpenDDE/sdaa/build.sh
++OpenDDE/sdaa/run.sh
++```
+ 
+-## 目录布局与构建
++`build.sh` 在首次运行时生成外层 `.env.sdaa` 并填写当前宿主机 UID/GID；核对固定基础镜像 ID，必要时编译原生 Kalign，构建独立镜像并启动 `opendde-sdaa` 容器。同名容器已存在时脚本会停止，避免覆盖现有环境。已有 `.dockerignore` 若缺少必要规则，脚本会先备份再补齐。源码与数据只读挂载；输出在 `work/`，临时文件在 `tmp/`。
+ 
+-脚本沿用复现工程布局；克隆仓库时将其放在项目根目录的 OpenDDE/ 子目录。在项目根目录下、与 OpenDDE/ 同级准备 data/、work/、tmp/ 和 vendor/。Docker 构建上下文必须是项目根目录，因为 Dockerfile 需要复制 OpenDDE/ 和 vendor/kalign-3.6.0/。data/ 放模型资产和数据库，均不纳入仓库。
++`run.sh` 默认从官方 `examples/example.json` 取出 7r6r，用仓库自带 MSA、BF16、seed 101、10 步、1 个循环在 `sdaa:0` 预测结构。每次运行生成独立的 `work/sdaa/acceptance_*/official_7r6r_*/`，其中有输入、日志和 CIF。该示例不执行在线 MSA 搜索。其他入口：
+ 
+-在项目根目录执行：
++```bash
++OpenDDE/sdaa/run.sh doctor   # 环境与 SDAA 算子检查
++OpenDDE/sdaa/run.sh core     # 官方轻量推理验收
++OpenDDE/sdaa/run.sh search   # 搜索流程验收，需另备搜索数据/服务
++```
+ 
+-    cp OpenDDE/sdaa/dockerignore .dockerignore
+-    cp OpenDDE/sdaa/.env.sdaa.example .env.sdaa
+-    # 按目标主机核对并修改 BASE_IMAGE_ID、HOST_UID、HOST_GID 等值
+-    OpenDDE/sdaa/build-kalign-sdaa.sh
+-    OpenDDE/sdaa/build-sdaa.sh
+-    OpenDDE/sdaa/run-official-examples-sdaa.sh doctor
+-    OpenDDE/sdaa/run-official-examples-sdaa.sh core
+-
+-当前基础镜像没有可用的远端 repo digest，因此构建脚本使用本地内容寻址 image ID 严格核对。Kalign 二进制由脚本在目标龙芯主机生成，不提交到仓库。build-sdaa.sh 若发现同名容器已经存在会停止，避免覆盖运行环境。
+-
+-run-official-examples-sdaa.sh 默认采用 10 个扩散步骤和 1 个循环；上游默认配置更大。可指定 core、prepared、template_smoke、json、runner 等阶段。部分完整官方复合物在当前单卡可用约 15 GiB 显存下仍会 OOM，不能把阶段中的跳过项当作通过。分块注意力与 LayerNorm 的实验性实现已撤回，环境示例不再设置旧分块参数。
+-
+-## 适配与对比记录
+-
+-源码修改点、第三方依赖与 wheel 判断、CUDA/SDAA 精度和性能对比、已知显存与搜索限制，以及复跑命令见 SDAA_ADAPTATION.md。原始运行日志与输出保存在独立复现工程的 work/，不提交到源码仓库。
++目录说明：`build/` 存放 Dockerfile、环境模板和版本锁；`scripts/` 存放内部构建与验收脚本；`docs/` 存放[完整复现步骤](docs/LOONG_SDAA_REPRO.md)与[迁移和 CUDA/SDAA 对比](docs/SDAA_ADAPTATION.md)；`patches/` 是历史适配补丁归档。模型权重、数据库、容器和输出不在仓库中。
+diff --git a/sdaa/build-sdaa.sh b/sdaa/build.sh
+similarity index 58%
+rename from sdaa/build-sdaa.sh
+rename to sdaa/build.sh
+index cb0e0f9..948c52e 100755
+--- a/sdaa/build-sdaa.sh
++++ b/sdaa/build.sh
+@@ -2,15 +2,20 @@
+ set -euo pipefail
+ 
+ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+-cd "${ROOT}"
+-if [[ ! -f "$ROOT/.dockerignore" ]]; then
+-    echo "Missing $ROOT/.dockerignore; copy OpenDDE/sdaa/dockerignore first." >&2
+-    exit 1
+-fi
+-ENV_FILE="${OPENDDE_ENV_FILE:-${ROOT}/.env.sdaa}"
+-if [[ ! -f "${ENV_FILE}" ]]; then
+-    echo "Missing ${ENV_FILE}; copy OpenDDE/sdaa/.env.sdaa.example and set the fixed image ID and host UID/GID." >&2
+-    exit 1
++SDAA_DIR="$ROOT/OpenDDE/sdaa"
++cd "$ROOT"
++mkdir -p "$ROOT/data" "$ROOT/work" "$ROOT/tmp" "$ROOT/vendor"
++
++ENV_FILE="${OPENDDE_ENV_FILE:-$ROOT/.env.sdaa}"
++if [[ ! -f "$ENV_FILE" ]]; then
++    if [[ -n "${OPENDDE_ENV_FILE:-}" ]]; then
++        echo "Specified environment file does not exist: $ENV_FILE" >&2
++        exit 1
++    fi
++    cp "$SDAA_DIR/build/.env.sdaa.example" "$ENV_FILE"
++    sed -i "s/^HOST_UID=.*/HOST_UID=$(id -u)/" "$ENV_FILE"
++    sed -i "s/^HOST_GID=.*/HOST_GID=$(id -g)/" "$ENV_FILE"
++    echo "Created $ENV_FILE with the pinned base image ID and current host UID/GID."
+ fi
+ set -a
+ # This file contains only non-secret build pins.
+@@ -18,6 +23,31 @@ source "${ENV_FILE}"
+ set +a
+ OPENDDE_CONTAINER="${OPENDDE_CONTAINER:-opendde-sdaa}"
+ 
++if docker container inspect "${OPENDDE_CONTAINER}" >/dev/null 2>&1; then
++    echo "Container ${OPENDDE_CONTAINER} already exists; inspect it before reusing this script." >&2
++    exit 1
++fi
++
++if [[ ! -f "$ROOT/.dockerignore" ]]; then
++    cp "$SDAA_DIR/build/dockerignore" "$ROOT/.dockerignore"
++fi
++missing_rules=()
++while IFS= read -r rule; do
++    if [[ -z "$rule" || "$rule" == \#* ]]; then
++        continue
++    fi
++    if ! grep -Fxq -- "$rule" "$ROOT/.dockerignore"; then
++        missing_rules+=("$rule")
++    fi
++done < "$SDAA_DIR/build/dockerignore"
++if (( ${#missing_rules[@]} > 0 )); then
++    mkdir -p "$ROOT/backups"
++    ignore_backup="$ROOT/backups/dockerignore-before-sdaa-$(date +%Y%m%d-%H%M%S)"
++    cp -p "$ROOT/.dockerignore" "$ignore_backup"
++    printf '\n%s\n' "${missing_rules[@]}" >> "$ROOT/.dockerignore"
++    echo "Added missing Docker ignore rules; previous file: $ignore_backup"
++fi
++
+ actual_image_id="$(docker image inspect "${BASE_IMAGE}" --format '{{.Id}}')"
+ if [[ "${actual_image_id}" != "${BASE_IMAGE_ID}" ]]; then
+     echo "Base image ID mismatch: expected ${BASE_IMAGE_ID}, found ${actual_image_id}" >&2
+@@ -28,20 +58,23 @@ if [[ "$(id -u)" != "${HOST_UID}" || "$(id -g)" != "${HOST_GID}" ]]; then
+     exit 1
+ fi
+ KALIGN_BIN="$ROOT/vendor/kalign-3.6.0/bin/kalign"
+-EXPECTED_KALIGN_SHA="$(sed -n 's/^kalign_binary_sha256=//p' "$ROOT/OpenDDE/sdaa/source.sdaa.lock")"
+-actual_kalign_sha="$(sha256sum "$KALIGN_BIN" | awk '{print $1}')"
+-if [[ ! -x "$KALIGN_BIN" || "$actual_kalign_sha" != "$EXPECTED_KALIGN_SHA" ]]; then
+-    echo "Kalign artifact missing or checksum mismatch: expected $EXPECTED_KALIGN_SHA, found $actual_kalign_sha" >&2
++EXPECTED_KALIGN_SHA="$(sed -n 's/^kalign_binary_sha256=//p' "$SDAA_DIR/build/source.sdaa.lock")"
++if [[ ! -e "$KALIGN_BIN" ]]; then
++    "$SDAA_DIR/scripts/build-kalign.sh"
++fi
++if [[ ! -x "$KALIGN_BIN" ]]; then
++    echo "Kalign artifact is not executable: $KALIGN_BIN" >&2
+     exit 1
+ fi
+-KALIGN_COMMIT="$(sed -n 's/^kalign_source_commit=//p' "$ROOT/OpenDDE/sdaa/source.sdaa.lock")"
+-if docker container inspect "${OPENDDE_CONTAINER}" >/dev/null 2>&1; then
+-    echo "Container ${OPENDDE_CONTAINER} already exists; inspect it before reusing this script." >&2
++actual_kalign_sha="$(sha256sum "$KALIGN_BIN" | awk '{print $1}')"
++if [[ "$actual_kalign_sha" != "$EXPECTED_KALIGN_SHA" ]]; then
++    echo "Kalign checksum mismatch: expected $EXPECTED_KALIGN_SHA, found $actual_kalign_sha" >&2
+     exit 1
+ fi
++KALIGN_COMMIT="$(sed -n 's/^kalign_source_commit=//p' "$SDAA_DIR/build/source.sdaa.lock")"
+ 
+ docker build \
+-    --file OpenDDE/sdaa/Dockerfile.sdaa \
++    --file OpenDDE/sdaa/build/Dockerfile.sdaa \
+     --tag "${OPENDDE_IMAGE}" \
+     --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
+     --build-arg "BASE_IMAGE_ID=${BASE_IMAGE_ID}" \
+diff --git a/sdaa/.env.sdaa.example b/sdaa/build/.env.sdaa.example
+similarity index 100%
+rename from sdaa/.env.sdaa.example
+rename to sdaa/build/.env.sdaa.example
+diff --git a/sdaa/Dockerfile.sdaa b/sdaa/build/Dockerfile.sdaa
+similarity index 100%
+rename from sdaa/Dockerfile.sdaa
+rename to sdaa/build/Dockerfile.sdaa
+diff --git a/sdaa/dockerignore b/sdaa/build/dockerignore
+similarity index 100%
+rename from sdaa/dockerignore
+rename to sdaa/build/dockerignore
+diff --git a/sdaa/source.sdaa.lock b/sdaa/build/source.sdaa.lock
+similarity index 100%
+rename from sdaa/source.sdaa.lock
+rename to sdaa/build/source.sdaa.lock
+diff --git a/sdaa/docs/LOONG_SDAA_REPRO.md b/sdaa/docs/LOONG_SDAA_REPRO.md
+new file mode 100644
+index 0000000..24a39b1
+--- /dev/null
++++ b/sdaa/docs/LOONG_SDAA_REPRO.md
+@@ -0,0 +1,64 @@
++# OpenDDE 龙芯 SDAA 完整复现
++
++本教程使用适配仓库和官方 `examples/example.json` 中的 7r6r 任务，调用仓库自带 MSA、通用权重 `opendde.pt`、BF16、seed 101、10 个扩散步、1 个循环，在 `sdaa:0` 生成结构。迁移问题与 CUDA 对比见 [SDAA_ADAPTATION.md](SDAA_ADAPTATION.md)。
++
++## 1. 固定源码与环境
++
++目标主机需为 loongarch64，有 Docker 权限、`/dev/tcaicard0` 至 `/dev/tcaicard7`、Git、Python 3、GCC 12.3.0 和 CMake 3.26.3。先加载锁定的本地基础镜像；其 tag 与 image ID 见 [source.sdaa.lock](../build/source.sdaa.lock)。当前镜像没有可用的远端 RepoDigest，构建脚本会按本地内容寻址 image ID 校验。
++
++从准备存放复现工程的目录执行，`REPO_URL` 为含 SDAA 修改的仓库，`ADAPT_COMMIT` 为要复现的完整提交 SHA：
++
++```bash
++test -n "$REPO_URL"
++test -n "$ADAPT_COMMIT"
++mkdir opendde-sdaa-repro
++cd opendde-sdaa-repro
++git clone "$REPO_URL" OpenDDE
++git -C OpenDDE checkout --detach "$ADAPT_COMMIT"
++test "$(uname -m)" = loongarch64
++git -C OpenDDE rev-parse HEAD
++BASE_IMAGE=$(sed -n 's/^base_image=//p' OpenDDE/sdaa/build/source.sdaa.lock)
++EXPECTED_IMAGE_ID=$(sed -n 's/^base_image_id=//p' OpenDDE/sdaa/build/source.sdaa.lock)
++test "$(docker image inspect "$BASE_IMAGE" --format '{{.Id}}')" = "$EXPECTED_IMAGE_ID"
++for card in 0 1 2 3 4 5 6 7; do test -e "/dev/tcaicard$card"; done
++```
++
++锁文件的 `source_commit` 是上游基线，不是适配提交。镜像 ID、设备或编译器版本不符时，先准备对应环境。
++
++## 2. 准备权重和通用数据
++
++外层目录与源码同级放置 `data/`、`work/`、`tmp/`、`vendor/`。这些目录不会提交仓库。官方 7r6r 示例需要 `data/checkpoint/opendde.pt`、`data/common/` 和仓库自带的 `OpenDDE/examples/7r6r/msa/`；无需 `data/search_database/`。可从同一发布版复制资产，或在外层目录运行：
++
++```bash
++mkdir -p data work tmp vendor
++OPENDDE_ROOT_DIR="$PWD/data" bash OpenDDE/scripts/download_opendde_data.sh --skip-search-database
++printf '%s  %s\n' \
++  7b826620390afad877ee2babc6a4d0df81b94d3a0be030959853d6a7da0807cc \
++  data/checkpoint/opendde.pt | sha256sum -c -
++for f in components.cif components.cif.rdkit_mol.pkl release_date_cache.json obsolete_to_successor.json; do
++  test -s "data/common/$f"
++done
++test -s OpenDDE/examples/7r6r/msa/1/pairing.a3m
++test -s OpenDDE/examples/7r6r/msa/1/non_pairing.a3m
++```
++
++## 3. 构建并运行
++
++```bash
++OpenDDE/sdaa/build.sh
++OpenDDE/sdaa/run.sh
++```
++
++首次调用 `build.sh` 时会从 [环境模板](../build/.env.sdaa.example) 创建外层 `.env.sdaa`，自动填写宿主机 UID/GID，核对固定镜像和 [Kalign 锁](../build/source.sdaa.lock)，必要时从源码构建龙芯原生 Kalign，再构建镜像和独立 venv，启动 `opendde-sdaa` 容器。同名容器存在时停止。源码与 `data/` 只读挂载，`work/` 与 `tmp/` 可写挂载。已有外层 `.dockerignore` 缺少必要规则时，脚本会先备份再补齐。若使用自定义配置，可设置 `OPENDDE_ENV_FILE` 指向已有文件。
++
++`run.sh` 默认仅提取官方 7r6r 任务，每次新建 `work/sdaa/acceptance_*/official_7r6r_*/` 并保存输入、`run.log`、预测 CIF。日志应有 `N_msa 703`，不应出现 `MSA server search started`。10 步和 1 个循环用于有界复现，不等于上游完整默认推理量。可用 `OPENDDE_INFERENCE_STEPS` 和 `OPENDDE_INFERENCE_CYCLES` 调整。
++
++## 4. 其他验收入口
++
++```bash
++OpenDDE/sdaa/run.sh doctor
++OpenDDE/sdaa/run.sh core
++OpenDDE/sdaa/run.sh search
++```
++
++`doctor` 检查设备、算子、BF16 与随机数；`core` 是轻量官方推理验收；`search` 需另备搜索服务、数据库和兼容的外部程序。完整 MSA 搜索不是上述 7r6r 推理的前提。更细的限制与已有实验数据见 [迁移记录](SDAA_ADAPTATION.md)。底层实现保存在 `../scripts/`，Dockerfile 和版本锁保存在 `../build/`。
+diff --git a/sdaa/SDAA_ADAPTATION.md b/sdaa/docs/SDAA_ADAPTATION.md
+similarity index 97%
+rename from sdaa/SDAA_ADAPTATION.md
+rename to sdaa/docs/SDAA_ADAPTATION.md
+index 5f66f6d..64ec5a3 100644
+--- a/sdaa/SDAA_ADAPTATION.md
++++ b/sdaa/docs/SDAA_ADAPTATION.md
+@@ -12,7 +12,7 @@
+ | 环境 | 架构与系统 | 镜像 digest/ID | Python/框架及设备插件 | GPU/实际后端 | 环境锁 |
+ | --- | --- | --- | --- | --- | --- |
+ | CUDA 基线 | Intel Xeon Platinum 8468，x86_64，Linux 5.15 | 基础镜像 digest：sha256:2b59b1b91885677814f78be1f8df48a25d5dc952eb6580eaecfefca510f9afd3；实测容器 image ID 相同 | Python 3.11.16，PyTorch 2.7.1+cu126，CUDA 12.6 | NVIDIA H100 80 GB，cuda:0 | 复现工程外层 source.lock、locks/、checksums.sha256 |
+-| 龙芯适配 | Loongson-3C6000/D，loongarch64，Loongnix Server 23.1 | 本地基础镜像 ID：sha256:3e425da47a74a03b589f8e1c18a67dcb90c8bcbde977cc1df09fa01209b7a524；无 RepoDigest | Python 3.12.13，PyTorch 2.12.0，torch_sdaa 3.2.1 | 8 卡已映射；实测单进程 sdaa:0 | sdaa/source.sdaa.lock、sdaa/.env.sdaa.example |
++| 龙芯适配 | Loongson-3C6000/D，loongarch64，Loongnix Server 23.1 | 本地基础镜像 ID：sha256:3e425da47a74a03b589f8e1c18a67dcb90c8bcbde977cc1df09fa01209b7a524；无 RepoDigest | Python 3.12.13，PyTorch 2.12.0，torch_sdaa 3.2.1 | 8 卡已映射；实测单进程 sdaa:0 | sdaa/build/source.sdaa.lock、sdaa/build/.env.sdaa.example |
+ 
+ 权重、搜索数据库和输出均不随源码仓库提交。
+ 
+@@ -33,7 +33,7 @@
+ 
+ | 包及版本 | 为什么需要适配 | 来源/许可证 | 构建命令或 wheel 标签 | SHA-256 |
+ | --- | --- | --- | --- | ---  |
+-| Kalign 3.6.0（命令行程序，非 wheel） | 龙芯上需要原生 loongarch64 可执行文件 | 上游 TimoLassmann/kalign；许可证文本随构建产物保存 | sdaa/build-kalign-sdaa.sh；产物不提交仓库 | ecebb6b6320f1b242d982f4c8c5825c6c83585fedc49fa51c3086972ce0ea391 |
++| Kalign 3.6.0（命令行程序，非 wheel） | 龙芯上需要原生 loongarch64 可执行文件 | 上游 TimoLassmann/kalign；许可证文本随构建产物保存 | sdaa/scripts/build-kalign.sh；产物不提交仓库 | ecebb6b6320f1b242d982f4c8c5825c6c83585fedc49fa51c3086972ce0ea391 |
+ 
+ HMMER 是完整模板搜索的外部程序，当前使用 x86_64 程序加 QEMU；现成 MSA 的 7r6r 推理不依赖它，也不能把它写成已完成的龙芯原生 wheel。
+ 
+diff --git a/sdaa/run-official-examples-sdaa.sh b/sdaa/run-official-examples-sdaa.sh
+deleted file mode 100755
+index 35b242f..0000000
+--- a/sdaa/run-official-examples-sdaa.sh
++++ /dev/null
+@@ -1,64 +0,0 @@
+-#!/usr/bin/env bash
+-set -euo pipefail
+-
+-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+-STAGE="${1:-all}"
+-OPENDDE_CONTAINER="${OPENDDE_CONTAINER:-opendde-sdaa}"
+-ACCEPTANCE_NAME="${OPENDDE_ACCEPTANCE_NAME:-acceptance}"
+-OPENDDE_INFERENCE_STEPS="${OPENDDE_INFERENCE_STEPS:-10}"
+-OPENDDE_INFERENCE_CYCLES="${OPENDDE_INFERENCE_CYCLES:-1}"
+-WORK_ROOT="${ROOT}/work/sdaa/${ACCEPTANCE_NAME}"
+-cd "${ROOT}"
+-mkdir -p "${WORK_ROOT}/logs"
+-
+-if [[ "$(docker inspect --format '{{.State.Status}}' "${OPENDDE_CONTAINER}" 2>/dev/null || true)" != "running" ]]; then
+-    echo "SDAA container is not running; run OpenDDE/sdaa/build-sdaa.sh first." >&2
+-    exit 1
+-fi
+-
+-if [[ "$STAGE" == "doctor" ]]; then
+-    docker exec -i "${OPENDDE_CONTAINER}" python /workspace/repro/OpenDDE/sdaa/container/verify_sdaa_environment.py 2>&1 | tee "$WORK_ROOT/logs/doctor-run.log"
+-    exit
+-fi
+-
+-case "${STAGE}" in
+-    core|prepared|templates|template_smoke|json|runner|runner_full|search)
+-        stages=("${STAGE}")
+-        ;;
+-    all)
+-        stages=(core prepared json runner)
+-        ;;
+-    *)
+-        echo "Usage: $0 [doctor|core|prepared|templates|template_smoke|json|runner|runner_full|search|all]" >&2
+-        exit 2
+-        ;;
+-esac
+-
+-status=0
+-for stage in "${stages[@]}"; do
+-    stage_log="${WORK_ROOT}/logs/${stage}-run.log"
+-    set +e
+-    docker exec -i \
+-        --env WORK_ROOT=/workspace/repro/work/sdaa/${ACCEPTANCE_NAME} \
+-        --env OPENDDE_INFERENCE_STEPS="${OPENDDE_INFERENCE_STEPS}" \
+-        --env OPENDDE_INFERENCE_CYCLES="${OPENDDE_INFERENCE_CYCLES}" \
+-        "${OPENDDE_CONTAINER}" \
+-        bash /workspace/repro/OpenDDE/sdaa/container/acceptance.sh "${stage}" \
+-        2>&1 | tee "${stage_log}"
+-    stage_status="${PIPESTATUS[0]}"
+-    set -e
+-    if [[ "${stage_status}" -ne 0 ]]; then
+-        status="${stage_status}"
+-        echo "Acceptance stage ${stage} failed; see ${stage_log}" >&2
+-        break
+-    fi
+-    echo "Acceptance stage ${stage} passed: ${stage_log}"
+-done
+-
+-wrong_owner="$(find "${WORK_ROOT}" \( ! -user "$(id -u)" -o ! -group "$(id -g)" \) -print -quit)"
+-if [[ -n "${wrong_owner}" ]]; then
+-    echo "Output owner check failed for ${wrong_owner}; expected $(id -u):$(id -g)" >&2
+-    exit 1
+-fi
+-echo "Acceptance output ownership verified: $(id -u):$(id -g)"
+-exit "${status}"
+diff --git a/sdaa/run.sh b/sdaa/run.sh
+new file mode 100755
+index 0000000..bff8bb6
+--- /dev/null
++++ b/sdaa/run.sh
+@@ -0,0 +1,109 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++STAGE="${1:-official}"
++OPENDDE_CONTAINER="${OPENDDE_CONTAINER:-opendde-sdaa}"
++ACCEPTANCE_NAME="${OPENDDE_ACCEPTANCE_NAME:-acceptance}_$(date +%Y%m%d-%H%M%S)_$$"
++OPENDDE_INFERENCE_STEPS="${OPENDDE_INFERENCE_STEPS:-10}"
++OPENDDE_INFERENCE_CYCLES="${OPENDDE_INFERENCE_CYCLES:-1}"
++WORK_ROOT="${ROOT}/work/sdaa/${ACCEPTANCE_NAME}"
++cd "${ROOT}"
++mkdir -p "${WORK_ROOT}/logs"
++
++if [[ "$(docker inspect --format '{{.State.Status}}' "${OPENDDE_CONTAINER}" 2>/dev/null || true)" != "running" ]]; then
++    echo "SDAA container is not running; run OpenDDE/sdaa/build.sh first." >&2
++    exit 1
++fi
++
++if [[ "$STAGE" == "doctor" ]]; then
++    docker exec -i "${OPENDDE_CONTAINER}" python /workspace/repro/OpenDDE/sdaa/scripts/container/verify_sdaa_environment.py 2>&1 | tee "$WORK_ROOT/logs/doctor-run.log"
++    exit
++fi
++
++if [[ "$STAGE" == "official" ]]; then
++    run_name="official_7r6r_$(date +%Y%m%d-%H%M%S)_$$"
++    run_dir="$WORK_ROOT/$run_name"
++    mkdir "$run_dir"
++    python3 - "$ROOT/OpenDDE/examples/example.json" "$run_dir/input_7r6r.json" <<'PY_JSON'
++import json
++import sys
++from pathlib import Path
++
++jobs = json.loads(Path(sys.argv[1]).read_text())
++selected = [job for job in jobs if job["name"] == "7r6r"]
++if len(selected) != 1:
++    raise SystemExit("Expected exactly one official 7r6r task")
++Path(sys.argv[2]).write_text(json.dumps(selected, indent=2) + "\n")
++PY_JSON
++    container_run_dir="/workspace/repro/work/sdaa/${ACCEPTANCE_NAME}/${run_name}"
++    set +e
++    docker exec -i \
++        --env "RUN_DIR=$container_run_dir" \
++        --env "INFERENCE_STEPS=$OPENDDE_INFERENCE_STEPS" \
++        --env "INFERENCE_CYCLES=$OPENDDE_INFERENCE_CYCLES" \
++        "$OPENDDE_CONTAINER" bash -lc '
++            cd /workspace/repro/OpenDDE &&
++            test -s examples/7r6r/msa/1/pairing.a3m &&
++            test -s examples/7r6r/msa/1/non_pairing.a3m &&
++            opendde pred -i "$RUN_DIR/input_7r6r.json" -o "$RUN_DIR/result" \
++                -s 101 -n opendde_v1 --device sdaa \
++                --use_msa true --use_template false --use_rna_msa false \
++                --trimul_kernel torch --triatt_kernel torch --enable_tf32 false \
++                --sample 1 --step "$INFERENCE_STEPS" --cycle "$INFERENCE_CYCLES" --dtype bf16
++        ' 2>&1 | tee "$run_dir/run.log"
++    run_status="${PIPESTATUS[0]}"
++    set -e
++    if [[ "$run_status" -ne 0 ]]; then
++        echo "Official 7r6r inference failed; see $run_dir/run.log" >&2
++        exit "$run_status"
++    fi
++    if ! find "$run_dir/result" -type f -name '*.cif' -print -quit | grep -q .; then
++        echo "Official 7r6r inference produced no CIF; see $run_dir/run.log" >&2
++        exit 1
++    fi
++    echo "Official 7r6r result: $run_dir/result"
++    exit 0
++fi
++
++case "${STAGE}" in
++    core|prepared|templates|template_smoke|json|runner|runner_full|search)
++        stages=("${STAGE}")
++        ;;
++    all)
++        stages=(core prepared json runner)
++        ;;
++    *)
++        echo "Usage: $0 [official|doctor|core|prepared|templates|template_smoke|json|runner|runner_full|search|all]" >&2
++        exit 2
++        ;;
++esac
++
++status=0
++for stage in "${stages[@]}"; do
++    stage_log="${WORK_ROOT}/logs/${stage}-run.log"
++    set +e
++    docker exec -i \
++        --env WORK_ROOT=/workspace/repro/work/sdaa/${ACCEPTANCE_NAME} \
++        --env OPENDDE_INFERENCE_STEPS="${OPENDDE_INFERENCE_STEPS}" \
++        --env OPENDDE_INFERENCE_CYCLES="${OPENDDE_INFERENCE_CYCLES}" \
++        "${OPENDDE_CONTAINER}" \
++        bash /workspace/repro/OpenDDE/sdaa/scripts/container/acceptance.sh "${stage}" \
++        2>&1 | tee "${stage_log}"
++    stage_status="${PIPESTATUS[0]}"
++    set -e
++    if [[ "${stage_status}" -ne 0 ]]; then
++        status="${stage_status}"
++        echo "Acceptance stage ${stage} failed; see ${stage_log}" >&2
++        break
++    fi
++    echo "Acceptance stage ${stage} passed: ${stage_log}"
++done
++
++wrong_owner="$(find "${WORK_ROOT}" \( ! -user "$(id -u)" -o ! -group "$(id -g)" \) -print -quit)"
++if [[ -n "${wrong_owner}" ]]; then
++    echo "Output owner check failed for ${wrong_owner}; expected $(id -u):$(id -g)" >&2
++    exit 1
++fi
++echo "Acceptance output ownership verified: $(id -u):$(id -g)"
++exit "${status}"
+diff --git a/sdaa/build-kalign-sdaa.sh b/sdaa/scripts/build-kalign.sh
+similarity index 95%
+rename from sdaa/build-kalign-sdaa.sh
+rename to sdaa/scripts/build-kalign.sh
+index d0ba63a..40637f9 100755
+--- a/sdaa/build-kalign-sdaa.sh
++++ b/sdaa/scripts/build-kalign.sh
+@@ -1,8 +1,8 @@
+ #!/usr/bin/env bash
+ set -euo pipefail
+ 
+-ROOT="$(cd "$(dirname "$BASH_SOURCE")/../.." && pwd)"
+-LOCK="$ROOT/OpenDDE/sdaa/source.sdaa.lock"
++ROOT="$(cd "$(dirname "$BASH_SOURCE")/../../.." && pwd)"
++LOCK="$ROOT/OpenDDE/sdaa/build/source.sdaa.lock"
+ get_pin() {
+     sed -n "s/^$1=//p" "$LOCK"
+ }
+diff --git a/sdaa/container/acceptance.sh b/sdaa/scripts/container/acceptance.sh
+similarity index 99%
+rename from sdaa/container/acceptance.sh
+rename to sdaa/scripts/container/acceptance.sh
+index 203fab0..433f2b9 100644
+--- a/sdaa/container/acceptance.sh
++++ b/sdaa/scripts/container/acceptance.sh
+@@ -418,7 +418,7 @@ search_prep_rna() {
+ run_stage() {
+     case "$1" in
+         doctor)
+-            step sdaa_runtime python /workspace/repro/OpenDDE/sdaa/container/verify_sdaa_environment.py
++            step sdaa_runtime python /workspace/repro/OpenDDE/sdaa/scripts/container/verify_sdaa_environment.py
+             ;;
+         core)
+             step core_protein_200_fp32 core_protein_200_fp32
+diff --git a/sdaa/container/verify_sdaa_environment.py b/sdaa/scripts/container/verify_sdaa_environment.py
+similarity index 100%
+rename from sdaa/container/verify_sdaa_environment.py
+rename to sdaa/scripts/container/verify_sdaa_environment.py
+-- 
+2.41.0
+
